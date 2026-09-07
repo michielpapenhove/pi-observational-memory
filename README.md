@@ -65,6 +65,12 @@ Topic files require `id` (matching the filename stem), `title`, `summary`, `upda
 
 Writes use a unique temporary file plus rename, with owner-only file permissions. This is **atomic per file, not a multi-file transaction**. A failed run may have updated some topics; the source observations stay available for retry. Failed workers write a failure receipt with the cause, never an acknowledgement. Missing receipts produce a readable incomplete-run error rather than a raw ENOENT. There is no journal, migration framework or automatic duplicate-tree merge. Files are session-scoped but intentionally not rolled back by `/tree`.
 
+## Session-start memory intro
+
+`before_agent_start` injects **one** persisted message (`om.memory-intro`, visible in the TUI) when om is enabled and the session has durable memory: the memory map rendered inline (same renderer as compaction) plus pointers to `JOURNEY.md` and the topic files, and an instruction to read them before re-deriving or re-asking known context. The memory map otherwise only appears in the compaction block, leaving fresh forks (or sessions that never reach the compaction threshold) blind to their own seeded memory. When there is nothing durable yet (no topics, no journey), nothing is injected.
+
+Self-gating, no leakage: the per-session `/om` gate (`runtime.enabled`/`memoryRoot`), `OM_WORKER` (observer/consolidator subprocesses), and the `.runs/memory-intro` marker for exactly-once. The marker lives in the transient `.runs/` tree, which fork seeding skips, so a fork always receives its own intro even though it seeded the parent's files; it also survives resume/reload. To revert, remove the `registerMemoryInjectHook` line in `src/index.ts` and the hook file.
+
 ## Commands
 
 - `/om`, `/om on`, `/om off`: session-local gate, default off.

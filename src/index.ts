@@ -16,6 +16,7 @@ import { registerStatusCommand } from "./commands/status.js";
 import { registerCompactionHook } from "./hooks/compaction-hook.js";
 import { registerCompactionTrigger } from "./hooks/compaction-trigger.js";
 import { registerConsolidatorTrigger } from "./hooks/consolidator-trigger.js";
+import { registerMemoryInjectHook } from "./hooks/memory-inject-hook.js";
 import { registerObserverTrigger } from "./hooks/observer-trigger.js";
 import { OM_ENABLED, type Entry } from "./ledger/index.js";
 import { ensureSessionMemory } from "./memory/session.js";
@@ -102,6 +103,7 @@ export default function observationalMemory(pi: ExtensionAPI): void {
 	registerConsolidatorTrigger(pi, runtime);
 	registerCompactionTrigger(pi, runtime);
 	registerCompactionHook(pi, runtime);
+	registerMemoryInjectHook(pi, runtime);
 
 	registerStatusCommand(pi, runtime);
 	registerCompactCommand(pi, runtime);
