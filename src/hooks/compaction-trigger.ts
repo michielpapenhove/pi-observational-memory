@@ -38,7 +38,7 @@ function turnWillContinue(event: any): boolean {
 	if (Array.isArray(toolResults) && toolResults.length > 0) return true;
 	// Fallback for shapes without toolResults: an assistant that stopped to call tools.
 	const stop = event?.message?.stopReason;
-	return stop === "tool_use" || stop === "tool_calls";
+	return stop === "toolUse" || stop === "tool_use" || stop === "tool_calls";
 }
 
 /**
@@ -80,6 +80,7 @@ export function registerCompactionTrigger(pi: ExtensionAPI, runtime: Runtime): v
 		// (post-abort, post-reload) no longer reflects whether the turn had pending tool work.
 		const shouldResume = runtime.config.resumeAfterMidRunCompaction && turnWillContinue(event);
 
+		const generation = runtime.generation;
 		const hasUI = ctx.hasUI;
 		const ui = ctx.ui;
 		runtime.compactInFlight = true;
@@ -88,6 +89,7 @@ export function registerCompactionTrigger(pi: ExtensionAPI, runtime: Runtime): v
 		// Fire-and-forget. The before-compact hook waits for observers and renders the block.
 		ctx.compact({
 			onComplete: () => {
+				if (!runtime.isCurrent(generation)) return;
 				runtime.compactInFlight = false;
 				if (hasUI) ui?.notify("om: compaction complete", "info");
 				// Resume only a mid-run compaction, and only if still enabled (the gate may have
@@ -107,6 +109,7 @@ export function registerCompactionTrigger(pi: ExtensionAPI, runtime: Runtime): v
 				}
 			},
 			onError: (error: { message: string }) => {
+				if (!runtime.isCurrent(generation)) return;
 				runtime.compactInFlight = false;
 				if (error.message === "Compaction cancelled") return;
 				if (hasUI) ui?.notify(`om: ${error.message}`, "error");

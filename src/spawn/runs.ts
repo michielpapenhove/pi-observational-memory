@@ -8,8 +8,10 @@
  * Worker recordings themselves live in pi's GLOBAL session store, not here (decision 11).
  * `.memory/.runs/` clutter is not GC'd in v1 (accepted).
  */
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { atomicWrite } from "../memory/paths.js";
+export { atomicWrite } from "../memory/paths.js";
 
 /** What the observer model emits, before the orchestrator re-derives precise timestamp-ids. */
 export type RawObservation = {
@@ -31,8 +33,8 @@ export function runResultPath(root: string, runId: string): string {
 
 /**
  * Per-run cost handoff file. Written by the worker EXTENSION (never the model) from pi's
- * built-in `usage.cost.total`, read by the orchestrator after the process exits. Uniform
- * across roles — the consolidator has no observations result file but still reports cost here.
+ * built-in `usage.cost.total`, read by the orchestrator after the process exits.
+ * Both roles use this cost handoff, separate from their completion receipt.
  */
 export function runCostPath(root: string, runId: string): string {
 	return join(runsDir(root), `${runId}.cost.json`);
@@ -59,14 +61,6 @@ export function readWorkerCost(path: string): WorkerCostResult | undefined {
 	}
 }
 
-/** Atomic write (temp + rename) so a reader never sees a half-written file. */
-export function atomicWrite(path: string, content: string): void {
-	mkdirSync(dirname(path), { recursive: true });
-	const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
-	writeFileSync(tmp, content, "utf-8");
-	renameSync(tmp, path);
-}
-
 function isRawObservation(value: unknown): value is RawObservation {
 	if (!value || typeof value !== "object") return false;
 	const v = value as Record<string, unknown>;
@@ -79,7 +73,8 @@ export function readObserverResult(path: string): ObserverRunResult {
 	if (!raw || typeof raw !== "object" || !Array.isArray((raw as { observations?: unknown }).observations)) {
 		throw new Error("observer result missing observations array");
 	}
-	const observations = (raw as { observations: unknown[] }).observations.filter(isRawObservation);
+	const observations = (raw as { observations: unknown[] }).observations;
+	if (!observations.every(isRawObservation)) throw new Error("malformed observer observations");
 	return { observations };
 }
 

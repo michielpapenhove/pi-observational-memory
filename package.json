@@ -1,7 +1,7 @@
 {
   "name": "observational-memory",
   "version": "0.1.0",
-  "description": "Observational memory for pi — tiered, subprocess-backed memory: parallel observers feed a branch-local ledger buffer; a consolidator (Phase B) promotes the oldest observations into durable .memory/ topic files.",
+  "description": "Observational memory for Pi with serial observers, validated completion receipts, and session-scoped topic files.",
   "type": "module",
   "license": "MIT",
   "pi": {
@@ -17,7 +17,8 @@
     "@earendil-works/pi-agent-core": "*",
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-agent-core": "^0.74.0",

@@ -120,6 +120,7 @@ export function registerCompactionHook(pi: ExtensionAPI, runtime: Runtime): void
 			return { cancel: true };
 		}
 
+		const generation = runtime.generation;
 		runtime.compactHookInFlight = true;
 		try {
 			runtime.ensureConfig(ctx.cwd);
@@ -145,6 +146,11 @@ export function registerCompactionHook(pi: ExtensionAPI, runtime: Runtime): void
 				snap = snapCutoff(branch, firstKeptEntryId, tailTokens);
 			}
 
+			if (!runtime.isCurrent(generation) || event.signal?.aborted) return { cancel: true };
+			if (snap.tail === undefined) {
+				if (hasUI) ctx.ui.notify("om: no confirmed observer boundary; compaction cancelled to retain raw history", "warning");
+				return { cancel: true };
+			}
 			const snapped = snap.firstKeptId;
 			const projection = buildCompactionProjection(branch, snapped);
 			// Phase B: render the long-term tier live from disk, regenerated each compaction
@@ -163,7 +169,7 @@ export function registerCompactionHook(pi: ExtensionAPI, runtime: Runtime): void
 				},
 			};
 		} finally {
-			runtime.compactHookInFlight = false;
+			if (runtime.generation === generation) runtime.compactHookInFlight = false;
 		}
 	});
 }

@@ -42,16 +42,30 @@ export default function observationalMemory(pi: ExtensionAPI): void {
 		}
 	}
 
-	pi.on("session_start", (_event: unknown, ctx: any) => {
+	function restore(_event: unknown, ctx: any): void {
+		runtime.abortAllWorkers();
+		runtime.status.detach();
+		runtime.configLoaded = false;
+		runtime.memoryRoot = "";
 		runtime.ensureConfig(ctx.cwd);
-		runtime.dispatchedCoversUpToId = undefined;
 		const branch = ctx.sessionManager.getBranch() as Entry[];
 		runtime.enabled = readGateFromLedger(branch);
 		if (runtime.enabled) runtime.memoryRoot = ensureSessionMemory(ctx);
 		attachIfEnabled(ctx);
 		runtime.refreshFooterGauges(branch, ctx.getContextUsage?.()?.tokens ?? null);
 		runtime.refreshCost(ctx.sessionManager.getEntries() as Entry[]);
+	}
+	pi.on("session_start", restore);
+	pi.on("session_tree", restore);
+	pi.on("agent_start", (_event, ctx) => attachIfEnabled(ctx));
+
+	// Cancel before navigation, even if another extension subsequently cancels the navigation.
+	pi.on("session_before_tree", () => {
+		runtime.abortAllWorkers();
+		runtime.status.detach();
 	});
+	pi.on("session_before_switch", () => runtime.abortAllWorkers());
+	pi.on("session_before_fork", () => runtime.abortAllWorkers());
 
 	pi.on("session_shutdown", () => {
 		runtime.status.detach();
@@ -70,6 +84,7 @@ export default function observationalMemory(pi: ExtensionAPI): void {
 			runtime.enabled = next;
 			pi.appendEntry(OM_ENABLED, { enabled: next });
 			if (next) {
+				runtime.abortAllWorkers();
 				runtime.memoryRoot = ensureSessionMemory(ctx);
 				attachIfEnabled(ctx);
 				runtime.refreshFooterGauges(ctx.sessionManager.getBranch() as Entry[], ctx.getContextUsage?.()?.tokens ?? null);

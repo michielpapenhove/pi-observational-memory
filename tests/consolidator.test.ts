@@ -44,23 +44,20 @@ describe("registerConsolidatorTools (scoped to .memory/)", () => {
 	});
 
 	it("refuses to write or edit INDEX.md", async () => {
-		const w = await tools.get("write").execute("1", { path: "INDEX.md", content: "x" });
-		expect(w.content[0].text).toContain("generated automatically");
+		await expect(tools.get("write").execute("1", { path: "INDEX.md", content: "x" })).rejects.toThrow("generated automatically");
 		expect(existsSync(join(memoryRoot, "INDEX.md"))).toBe(false);
 	});
 
 	it("rejects paths that escape .memory/", async () => {
-		const r = await tools.get("write").execute("1", { path: "../escape.md", content: "x" });
-		expect(r.content[0].text).toContain("escapes .memory/");
+		await expect(tools.get("write").execute("1", { path: "../escape.md", content: "x" })).rejects.toThrow("escapes .memory/");
 		expect(existsSync(join(cwd, "escape.md"))).toBe(false);
 	});
 
 	it("edit replaces an exact unique substring and rejects ambiguous matches", async () => {
 		await tools.get("write").execute("1", { path: "t.md", content: "alpha beta alpha" });
-		const ambiguous = await tools.get("edit").execute("2", { path: "t.md", oldText: "alpha", newText: "X" });
-		expect(ambiguous.content[0].text).toContain("ambiguous");
-		const ok = await tools.get("edit").execute("3", { path: "t.md", oldText: "beta", newText: "BETA" });
+		const ok = await tools.get("edit").execute("2", { path: "t.md", oldText: "beta", newText: "BETA" });
 		expect(ok.content[0].text).toContain("Edited");
+		await expect(tools.get("edit").execute("3", { path: "t.md", oldText: "alpha", newText: "X" })).rejects.toThrow("ambiguous");
 		expect(readFileSync(join(memoryRoot, "t.md"), "utf-8")).toBe("alpha BETA alpha");
 	});
 

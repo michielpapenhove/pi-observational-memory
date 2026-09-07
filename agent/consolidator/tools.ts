@@ -1,166 +1,103 @@
-/**
- * The consolidator's tool belt. `--no-builtin-tools` is set on the worker, so this extension
- * registers its own read/write/edit/ls/grep — all path-scoped to `.memory/` (design risk 6).
- * There is no result file: the file edits ARE the output, and the run ends by natural exit
- * of `pi -p` once the model emits its closing confirmation. The orchestrator then tombstones
- * the whole provided batch (it already knows exactly what it handed over).
- *
- * Scoping: every path argument is resolved against OM_MEMORY_DIR and rejected if it escapes
- * that directory, so a wayward model cannot read or clobber the user's project.
- */
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { join, relative, resolve } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
-import type { Static } from "typebox";
-import { atomicWrite } from "../../src/memory/paths.js";
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { resolve } from 'node:path';
+import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import { Type } from 'typebox';
+import { atomicWrite, resolveWithinMemory } from '../../src/memory/paths.js';
+import { validateDispositions, type Disposition, type WorkerRequest } from '../../src/spawn/receipt.js';
 
-type ToolText = { content: { type: "text"; text: string }[]; details: unknown };
+const MAX_FILE_BYTES = 512 * 1024;
+const pathSchema = Type.String({ description: "Bare filename in this session's memory root, e.g. auth.md. No directories or .memory/ prefix." });
+const text = (value: string, isError = false) => ({ content: [{ type: 'text' as const, text: value }], details: {}, isError });
 
-function ok(text: string, details: unknown = {}): ToolText {
-	return { content: [{ type: "text" as const, text }], details };
-}
-
-function fail(text: string): ToolText {
-	return { content: [{ type: "text" as const, text: `Error: ${text}` }], details: { error: true } };
-}
-
-/** Resolve a requested path against the sandbox root, or return undefined if it escapes. */
-function scoped(root: string, requested: string): string | undefined {
-	const abs = resolve(root, requested);
-	const rel = relative(root, abs);
-	if (rel === "") return abs;
-	if (rel.startsWith("..")) return undefined;
-	return abs;
-}
-
-const ReadSchema = Type.Object({
-	path: Type.String({ description: "Path inside .memory/, e.g. 'auth.md' or '.memory/auth.md'." }),
-});
-const WriteSchema = Type.Object({
-	path: Type.String({ description: "Path inside .memory/ to (over)write, e.g. 'auth.md'." }),
-	content: Type.String({ description: "Full file content, including YAML front-matter." }),
-});
-const EditSchema = Type.Object({
-	path: Type.String({ description: "Path inside .memory/ to edit." }),
-	oldText: Type.String({ description: "Exact text to replace (must occur exactly once)." }),
-	newText: Type.String({ description: "Replacement text." }),
-});
-const LsSchema = Type.Object({
-	path: Type.Optional(Type.String({ description: "Subdirectory inside .memory/. Defaults to .memory/ root." })),
-});
-const GrepSchema = Type.Object({
-	pattern: Type.String({ description: "JavaScript regular expression to search for." }),
-	path: Type.Optional(Type.String({ description: "Restrict to this file/subdir inside .memory/." })),
-});
-
-type ReadInput = Static<typeof ReadSchema>;
-type WriteInput = Static<typeof WriteSchema>;
-type EditInput = Static<typeof EditSchema>;
-type LsInput = Static<typeof LsSchema>;
-type GrepInput = Static<typeof GrepSchema>;
-
-function listFilesRecursive(dir: string): string[] {
-	const out: string[] = [];
-	for (const name of readdirSync(dir)) {
-		if (name.startsWith(".")) continue; // skip .runs and temp files
-		const full = join(dir, name);
-		if (statSync(full).isDirectory()) out.push(...listFilesRecursive(full));
-		else out.push(full);
-	}
-	return out;
-}
-
-/** Register the consolidator's scoped file tools (read/write/edit/ls/grep), all under .memory/. */
-export function registerConsolidatorTools(pi: ExtensionAPI, memoryRoot: string): void {
-	const root = resolve(memoryRoot);
-
-	pi.registerTool({
-		name: "read",
-		label: "Read memory file",
-		description: "Read a topic file under .memory/.",
-		parameters: ReadSchema,
-		async execute(_id: string, params: ReadInput): Promise<ToolText> {
-			const abs = scoped(root, params.path);
-			if (!abs) return fail("path escapes .memory/");
-			if (!existsSync(abs)) return fail(`no such file: ${params.path}`);
-			return ok(readFileSync(abs, "utf-8"));
-		},
-	});
-
-	pi.registerTool({
-		name: "write",
-		label: "Write memory file",
-		description: "Create or overwrite a topic file under .memory/ (atomic). Do not write INDEX.md.",
-		parameters: WriteSchema,
-		async execute(_id: string, params: WriteInput): Promise<ToolText> {
-			const abs = scoped(root, params.path);
-			if (!abs) return fail("path escapes .memory/");
-			if (/(^|\/)INDEX\.md$/i.test(params.path)) return fail("INDEX.md is generated automatically; do not write it");
-			atomicWrite(abs, params.content);
-			return ok(`Wrote ${params.path} (${params.content.length} bytes).`);
-		},
-	});
-
-	pi.registerTool({
-		name: "edit",
-		label: "Edit memory file",
-		description: "Replace an exact substring in a topic file under .memory/ (atomic).",
-		parameters: EditSchema,
-		async execute(_id: string, params: EditInput): Promise<ToolText> {
-			const abs = scoped(root, params.path);
-			if (!abs) return fail("path escapes .memory/");
-			if (/(^|\/)INDEX\.md$/i.test(params.path)) return fail("INDEX.md is generated automatically; do not edit it");
-			if (!existsSync(abs)) return fail(`no such file: ${params.path}`);
-			const current = readFileSync(abs, "utf-8");
-			const occurrences = current.split(params.oldText).length - 1;
-			if (occurrences === 0) return fail("oldText not found");
-			if (occurrences > 1) return fail(`oldText is ambiguous (${occurrences} matches); add more context`);
-			atomicWrite(abs, current.replace(params.oldText, params.newText));
-			return ok(`Edited ${params.path}.`);
-		},
-	});
-
-	pi.registerTool({
-		name: "ls",
-		label: "List memory files",
-		description: "List files under .memory/.",
-		parameters: LsSchema,
-		async execute(_id: string, params: LsInput): Promise<ToolText> {
-			const abs = scoped(root, params.path ?? ".");
-			if (!abs) return fail("path escapes .memory/");
-			if (!existsSync(abs)) return ok("(.memory/ is empty)");
-			const entries = readdirSync(abs).filter((n) => !n.startsWith("."));
-			return ok(entries.length > 0 ? entries.sort().join("\n") : "(empty)");
-		},
-	});
-
-	pi.registerTool({
-		name: "grep",
-		label: "Search memory files",
-		description: "Search topic files under .memory/ with a regular expression.",
-		parameters: GrepSchema,
-		async execute(_id: string, params: GrepInput): Promise<ToolText> {
-			let re: RegExp;
-			try {
-				re = new RegExp(params.pattern);
-			} catch (e) {
-				return fail(`invalid regex: ${(e as Error).message}`);
-			}
-			const base = scoped(root, params.path ?? ".");
-			if (!base) return fail("path escapes .memory/");
-			if (!existsSync(base)) return ok("(no matches)");
-			const files = statSync(base).isDirectory() ? listFilesRecursive(base) : [base];
-			const hits: string[] = [];
-			for (const file of files) {
-				const lines = readFileSync(file, "utf-8").split("\n");
-				const relPath = relative(root, file);
-				lines.forEach((line, i) => {
-					if (re.test(line)) hits.push(`${relPath}:${i + 1}: ${line.trim()}`);
-				});
-				if (hits.length >= 200) break;
-			}
-			return ok(hits.length > 0 ? hits.join("\n") : "(no matches)");
-		},
-	});
+/** A flat sandbox matching listTopics. All file operations are synchronous: no RMW await gap. */
+export function registerConsolidatorTools(pi: ExtensionAPI, memoryRoot: string, request?: WorkerRequest) {
+ const root = resolve(memoryRoot);
+ let failed = false;
+ let fatalError: string | undefined;
+ let correctionAttempts = 0;
+ const recoverableErrors = new Set<string>();
+ let completed: Disposition[] | undefined;
+ const pathFor = (path: string) => {
+  const absolute = resolveWithinMemory(root, path);
+  if (!absolute) throw new Error('path escapes .memory/ or is not a bare topic filename (symlinks forbidden)');
+  return absolute;
+ };
+ const read = (path: string) => {
+  const absolute = pathFor(path);
+  if (statSync(absolute).size > MAX_FILE_BYTES) throw new Error('memory file exceeds 512 KiB; split it before retrying');
+  return readFileSync(absolute, 'utf8');
+ };
+ const register = (name: string, description: string, parameters: any, run: (p: any) => string) => {
+  pi.registerTool({ name, label: name, description, parameters, async execute(_id, p) {
+   try {
+    if (failed) throw new Error('this run had tool errors; keep observations and retry the run');
+    return text(run(p));
+   } catch (error) {
+    // A rejected candidate ACK changed no files and committed no coverage. Let the model repair it.
+    if (name === 'complete_consolidation' && !failed && !completed && correctionAttempts < 3) {
+     correctionAttempts++;
+     recoverableErrors.add(_id);
+     throw error;
+    }
+    failed = true;
+    completed = undefined;
+    fatalError = name === 'complete_consolidation'
+     ? `confirmation failed; correction limit reached or run already failed: ${String(error)}`
+     : `${name} failed: ${String(error)}`;
+    throw new Error(fatalError);
+   }
+  } });
+ };
+ const writable = (path: string) => {
+  if (completed) throw new Error('completion already submitted; further mutations forbidden');
+  if (path.toUpperCase() === 'INDEX.MD') throw new Error('INDEX.md is generated automatically; do not write it');
+  if (path === '.') throw new Error('expected a filename');
+  return pathFor(path);
+ };
+ const write = (path: string, content: string) => {
+  const absolute = writable(path);
+  if (Buffer.byteLength(content) > MAX_FILE_BYTES) throw new Error('memory file exceeds 512 KiB');
+  atomicWrite(absolute, content);
+ };
+ register('read', 'Read a memory file. Paths are bare filenames.', Type.Object({ path: pathSchema }), p => read(p.path));
+ register('write', 'Atomically write a memory file. Preserve existing facts. Never write INDEX.md.', Type.Object({ path: pathSchema, content: Type.String() }), p => {
+  write(p.path, p.content); return `Wrote ${p.path} (${Buffer.byteLength(p.content)} bytes).`;
+ });
+ register('edit', 'Replace one exact unique substring, atomically.', Type.Object({ path: pathSchema, oldText: Type.String({ minLength: 1 }), newText: Type.String() }), p => {
+  writable(p.path);
+  if (!p.oldText) throw new Error('oldText must not be empty');
+  const before = read(p.path), count = before.split(p.oldText).length - 1;
+  if (count !== 1) throw new Error(count ? 'oldText is ambiguous' : 'oldText not found');
+  // Literal splice: replacement text must not interpret $&, $`, $\' as replace tokens.
+  const index = before.indexOf(p.oldText);
+  write(p.path, before.slice(0,index) + p.newText + before.slice(index + p.oldText.length));
+  return `Edited ${p.path}.`;
+ });
+ const filenames = () => {
+  pathFor('.');
+  return existsSync(root) ? readdirSync(root).filter(n => n !== '.' && resolveWithinMemory(root,n)).sort() : [];
+ };
+ register('ls', 'List flat memory files. Only path "." is supported.', Type.Object({ path: Type.Optional(Type.String()) }), p => {
+  if (p.path && p.path !== '.') throw new Error('memory has no subdirectories');
+  return filenames().join('\n') || '(empty)';
+ });
+ register('grep', 'Literal text search in memory files (not a regular expression).', Type.Object({ pattern: Type.String({ minLength: 1 }), path: Type.Optional(pathSchema) }), p => {
+  const files = p.path && p.path !== '.' ? [p.path] : filenames();
+  const hits: string[] = [];
+  for (const name of files) {
+   for (const [index,line] of read(name).split('\n').entries()) {
+    if (line.includes(p.pattern)) hits.push(`${name}:${index+1}: ${line.slice(0,500)}`);
+    if (hits.length >= 100) return hits.join('\n') + '\n[limited to 100 hits]';
+   }
+  }
+  return hits.join('\n') || '(no matches)';
+ });
+ if (request) register('complete_consolidation', 'Account for EVERY incoming observation with its topic path or an explicit discard reason. If rejected, resubmit the FULL corrected array using the listed missing/unknown/duplicate IDs. After acceptance, stop.', Type.Object({
+  dispositions: Type.Array(Type.Object({ timestamp: Type.String(), path: Type.Optional(pathSchema), reason: Type.Optional(Type.String()) }))
+ }), p => {
+  if (failed) throw new Error('this run had tool errors; keep observations and retry the run');
+  completed = validateDispositions(root, request.ids, p.dispositions);
+  return 'Completion recorded. Make no more tool calls. Reply with a one-sentence confirmation.';
+ });
+ return { result: () => failed || !completed ? undefined : { dispositions: completed }, recoverableErrors, failure: () => fatalError };
 }

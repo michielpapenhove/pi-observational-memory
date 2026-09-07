@@ -12,12 +12,12 @@ How you work:
 1. Read the conversation chunk and identify what information it contains.
 2. Call record_observations with a batch covering part (or all) of the chunk.
 3. Read the progress receipt. If content remains uncovered, call again. You may call the tool many times.
-4. When the chunk is fully covered, STOP calling the tool and reply with a brief plain-text confirmation (one short sentence). That ends the run.
+4. When the chunk is fully covered, set complete:true on your FINAL record_observations call. Then reply with a brief plain-text confirmation. Without complete:true, the run is incomplete and will be retried.
 
 What to emit:
 - Use the timestamp from the relevant conversation message ("YYYY-MM-DD HH:MM", local, to the minute). This goes in the timestamp field, not the content.
 - Group repeated similar tool calls into a single observation rather than one per call.
-- Skip routine, low-information events. It is fine to emit zero observations if the chunk carries no new information — in that case, do not call the tool and end with a plain-text confirmation.
+- Skip routine, low-information events. If there is no new information, call record_observations with observations:[] and complete:true, then give a plain-text confirmation.
 
 Observation content rules:
 
@@ -68,11 +68,3 @@ Detail preservation. Preserve distinguishing details so future queries can still
 Timestamp format: "YYYY-MM-DD HH:MM" (local time, 24-hour, to the minute). This goes in the timestamp field, not the content.
 
 Remember: these observations are the assistant's ONLY memory of this chunk once the raw messages fall out of context. Make them count.`;
-
-/**
- * Kickoff message passed as the `pi -p` positional arg. It only *triggers* the run; the
- * chunk itself is injected as a user message by the agent's `context` hook (see agent/index.ts),
- * never via the system prompt or shell args.
- */
-export const OBSERVER_KICKOFF =
-	"A conversation chunk has been placed in your context. Compress it into observations by calling record_observations one or more times, then reply with a one-sentence confirmation when the chunk is fully covered.";

@@ -21,7 +21,7 @@ function titleOf(topic: Topic): string {
 }
 
 /** The on-disk INDEX.md content. Orchestrator-owned; the consolidator never writes it. */
-export function renderIndexFile(topics: Topic[]): string {
+export function renderIndexFile(topics: Topic[], audience: "master" | "worker" = "master"): string {
 	const parts: string[] = ["# Memory index", ""];
 	if (topics.length === 0) {
 		parts.push("_No topics yet._");
@@ -31,7 +31,7 @@ export function renderIndexFile(topics: Topic[]): string {
 	for (const topic of topics) {
 		const updated = topic.updated ? ` · updated ${topic.updated}` : "";
 		parts.push(`## ${titleOf(topic)}`);
-		parts.push(`- \`${topic.path}\`${updated}`);
+		parts.push(`- \`${audience === "worker" ? topic.filename : topic.path}\`${updated}`);
 		parts.push(`- ${summaryOf(topic)}`);
 		parts.push("");
 	}

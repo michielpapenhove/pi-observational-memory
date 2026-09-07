@@ -2,6 +2,7 @@ import { estimateEntryTokens } from "../tokens.js";
 import {
 	OM_OBSERVATIONS_DROPPED,
 	OM_OBSERVATIONS_RECORDED,
+	isObservationsRecordedData,
 	type Entry,
 	type MemoryCustomType,
 } from "./types.js";
@@ -61,7 +62,7 @@ function isValidCoverageEntry(entry: Entry, customType: MemoryCustomType): entry
 	if (entry.type !== "custom" || entry.customType !== customType) return false;
 	if (!isObject(entry.data) || typeof entry.data.coversUpToId !== "string") return false;
 
-	if (customType === OM_OBSERVATIONS_RECORDED) return isNonEmptyArray(entry.data.observations);
+	if (customType === OM_OBSERVATIONS_RECORDED) return isObservationsRecordedData(entry.data);
 	return isNonEmptyArray(entry.data.observationTimestamps);
 }
 

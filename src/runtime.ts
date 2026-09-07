@@ -1,10 +1,13 @@
 import { type Config, DEFAULTS, loadConfig } from "./config.js";
 import { foldLedger, poolTokens, rawTokensSinceObservationCoverage, sumSessionCost, type Entry } from "./ledger/index.js";
 import { StatusController } from "./ui/status-controller.js";
+import { readActivity } from "./spawn/activity.js";
+import { debugLog, withDebugLogContext } from "./debug-log.js";
+import { basename } from "node:path";
 
 /**
- * In-process orchestrator state. Event-driven only — no daemon/timer beyond the status
- * spinner. Ephemeral: rebuilt on session_start, cleared on session_shutdown.
+ * Session-scoped orchestrator state. Triggers run on turns; timers only supervise
+ * workers and display activity. Late callbacks are fenced by generation.
  */
 export class Runtime {
 	config: Config = { ...DEFAULTS };
@@ -16,7 +19,7 @@ export class Runtime {
 	/**
 	 * Absolute `.memory/<sessionId>/` root for this session's durable + transient memory. Set
 	 * whenever the gate is enabled (session_start / `/om on`) via `ensureSessionMemory`; empty
-	 * while disabled. All path helpers (listTopics/indexPath/readJourney/run*Path) take this root.
+	 * until first enabled, retained on off while old workers finish. All path helpers (listTopics/indexPath/readJourney/run*Path) take this root.
 	 */
 	memoryRoot = "";
 
@@ -39,14 +42,16 @@ export class Runtime {
 	consolidatorInFlight = false;
 	consolidatorController: AbortController | undefined;
 
-	/**
-	 * coversUpToId of the most-recent chunk DISPATCHED (committed or still in flight). Combined
-	 * with the committed ledger watermark, this is the effective observation watermark: it keeps
-	 * parallel observers from re-selecting the same slice and lets zero-observation chunks (which
-	 * commit no ledger entry) still advance the clock. In-memory only — lost on resume (harmless;
-	 * worst case a chunk is re-observed).
-	 */
-	dispatchedCoversUpToId: string | undefined;
+	/** Invalidated on off, navigation, reload and session replacement; normal turns don't change it. */
+	generation = 0;
+	observerBlocked: string | undefined;
+	consolidatorBlocked: string | undefined;
+	observerFailures = 0;
+	observerRetryAt = 0;
+	consolidatorFailures = 0;
+	consolidatorRetryAt = 0;
+
+	isCurrent(generation: number): boolean { return this.enabled && this.generation === generation; }
 
 	/** Guards so compaction trigger + hook never re-enter. */
 	compactInFlight = false;
@@ -63,46 +68,19 @@ export class Runtime {
 
 	readonly status = new StatusController();
 
-	// ── Toast coalescer ──────────────────────────────────────────────────────────
-	// Parallel observers fire finish toasts from independent async tasks. If two
-	// land in the same event-loop tick, pi's showStatus() would replace the first
-	// with the second. queueToast() accumulates info lines and flushes them as a
-	// single multi-line notify on the next tick so both lines remain visible.
-
-	private pendingInfoToastLines: string[] = [];
-	private infoToastFlushTimer: ReturnType<typeof setTimeout> | undefined;
-
-	/**
-	 * Queue an info-level toast line for batched delivery on the next event-loop tick.
-	 * Non-info levels (warning/error) bypass the queue and fire immediately so they
-	 * always use their own styling and are never merged with info lines.
-	 */
-	queueToast(
-		line: string,
-		level: "info" | "warning" | "error",
-		notify: (message: string, level: "info" | "warning" | "error") => void,
-	): void {
-		if (level !== "info") {
-			notify(line, level);
-			return;
-		}
-		this.pendingInfoToastLines.push(line);
-		if (this.infoToastFlushTimer !== undefined) return;
-		this.infoToastFlushTimer = setTimeout(() => {
-			this.infoToastFlushTimer = undefined;
-			const lines = this.pendingInfoToastLines.splice(0);
-			if (lines.length > 0) notify(lines.join("\n"), "info");
-		}, 0);
-		this.infoToastFlushTimer.unref?.();
+	trace(runId: string, event: string, data: Record<string, unknown> = {}): void {
+		withDebugLogContext({ enabled: this.config.debugLog, sessionId: basename(this.memoryRoot), runId }, () => debugLog(event,data));
 	}
 
-	/** Discard any pending toast lines (called on session shutdown). */
-	cancelPendingToasts(): void {
-		if (this.infoToastFlushTimer !== undefined) {
-			clearTimeout(this.infoToastFlushTimer);
-			this.infoToastFlushTimer = undefined;
-		}
-		this.pendingInfoToastLines = [];
+	monitorWorker(runId: string, root: string): () => void {
+		const generation = this.generation;
+		const timer = setInterval(() => {
+			if (!this.isCurrent(generation)) return;
+			const activity = readActivity(root,runId);
+			if (activity) this.status.workerActivity(runId,activity);
+		}, 1000);
+		timer.unref?.();
+		return () => clearInterval(timer);
 	}
 
 	ensureConfig(cwd: string): void {
@@ -135,22 +113,25 @@ export class Runtime {
 		this.status.setCost(costUsd, runs);
 	}
 
-	/** Abort and forget all in-flight workers (session shutdown / disable). */
+	/** Invalidate callbacks and abort workers; retain occupied slots until close. */
 	abortAllWorkers(): void {
-		this.cancelPendingToasts();
+		this.generation++;
+		this.observerBlocked = this.consolidatorBlocked = undefined;
+		this.observerFailures = this.consolidatorFailures = 0;
+		this.observerRetryAt = this.consolidatorRetryAt = 0;
+		this.compactInFlight = this.compactHookInFlight = false;
 		for (const { controller } of this.observersInFlight.values()) {
 			controller.abort();
 		}
-		this.observersInFlight.clear();
+		// Keep slots occupied until close: off/on must not overlap an old writer with a new one.
 		this.consolidatorController?.abort();
-		this.consolidatorController = undefined;
-		this.consolidatorInFlight = false;
 	}
 
 	/** Track an observer task for the lifetime of its async run. */
 	trackObserverTask(task: Promise<void>): void {
 		this.observerTasks.add(task);
-		void task.finally(() => this.observerTasks.delete(task));
+		const settled = () => { this.observerTasks.delete(task); };
+		void task.then(settled, settled);
 	}
 
 	/** Resolve once no observer tasks are in flight (compaction blocks on this). */
@@ -161,6 +142,6 @@ export class Runtime {
 	}
 
 	get observerSlotsAvailable(): number {
-		return Math.max(0, this.config.observerConcurrency - this.observersInFlight.size);
+		return Math.max(0, 1 - this.observersInFlight.size);
 	}
 }

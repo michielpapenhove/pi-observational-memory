@@ -59,7 +59,7 @@ describe("observer result IPC round-trip", () => {
 		rmSync(dir, { recursive: true, force: true });
 	});
 
-	it("writes and reads back valid observations, dropping malformed ones", () => {
+	it("rejects the entire batch if any observation is malformed", () => {
 		const path = join(dir, "r.result.json");
 		writeObserverResult(path, {
 			observations: [
@@ -67,8 +67,7 @@ describe("observer result IPC round-trip", () => {
 				{ timestamp: "2026-06-25 14:31", content: "  " }, // dropped: blank content
 			],
 		});
-		const result = readObserverResult(path);
-		expect(result.observations).toEqual([{ timestamp: "2026-06-25 14:30", content: "ok" }]);
+		expect(() => readObserverResult(path)).toThrow("malformed");
 	});
 
 	it("throws on a result file missing the observations array", () => {
@@ -87,23 +86,24 @@ describe("registerObserverTool", () => {
 		rmSync(dir, { recursive: true, force: true });
 	});
 
-	it("writes an empty result file on registration and accumulates across calls", async () => {
+	it("accumulates across calls but only exposes explicitly completed results", async () => {
 		const path = join(dir, "r.result.json");
 		let tool: any;
 		const fakePi = { registerTool: (def: any) => (tool = def) } as any;
 
-		registerObserverTool(fakePi, path);
-		expect(readObserverResult(path).observations).toEqual([]);
+		const worker = registerObserverTool(fakePi);
+		expect(worker.result()).toBeUndefined();
 
 		await tool.execute("id1", { observations: [{ timestamp: "2026-06-25 14:30", content: "first" }] });
 		await tool.execute("id2", {
+			complete: true,
 			observations: [
 				{ timestamp: "2026-06-25 14:30", content: "first" }, // duplicate
 				{ timestamp: "2026-06-25 14:31", content: "second" },
 			],
 		});
 
-		expect(readObserverResult(path).observations).toEqual([
+		expect(worker.result()?.observations).toEqual([
 			{ timestamp: "2026-06-25 14:30", content: "first" },
 			{ timestamp: "2026-06-25 14:31", content: "second" },
 		]);

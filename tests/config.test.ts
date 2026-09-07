@@ -1,0 +1,21 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, expect, it, vi } from 'vitest';
+vi.mock('@earendil-works/pi-coding-agent', () => ({ getAgentDir: vi.fn() }));
+import { getAgentDir } from '@earendil-works/pi-coding-agent';
+import { loadConfig } from '../src/config.js';
+const roots:string[]=[];
+afterEach(()=>roots.splice(0).forEach(root=>rmSync(root,{recursive:true,force:true})));
+it('partial project model settings inherit unspecified global fields and the other role',()=>{
+ const root=mkdtempSync(join(tmpdir(),'om-config-'));roots.push(root);
+ const global=join(root,'global'),project=join(root,'project');
+ mkdirSync(global,{recursive:true});mkdirSync(join(project,'.pi'),{recursive:true});
+ vi.mocked(getAgentDir).mockReturnValue(global);
+ writeFileSync(join(global,'settings.json'),JSON.stringify({'observational-memory':{models:{observer:{provider:'test-provider',id:'old',thinking:'high'},consolidator:{provider:'another',id:'consolidator',thinking:'off'}},chunkTokens:3000}}));
+ writeFileSync(join(project,'.pi','settings.json'),JSON.stringify({'observational-memory':{models:{observer:{id:'new'}}}}));
+ const config=loadConfig(project,{});
+ expect(config.models.observer).toEqual({provider:'test-provider',id:'new',thinking:'high'});
+ expect(config.models.consolidator).toEqual({provider:'another',id:'consolidator',thinking:'off'});
+ expect(config.chunkTokens).toBe(3000);
+});

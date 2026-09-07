@@ -18,15 +18,6 @@ export function nowTimestamp(): string {
 	return fmtLocal(new Date());
 }
 
-export const MAX_RECORD_CONTENT_CHARS = 10_000;
-
-export function truncateRecordContent(content: string): string {
-	if (content.length <= MAX_RECORD_CONTENT_CHARS) return content;
-	const head = content.slice(0, MAX_RECORD_CONTENT_CHARS);
-	const dropped = content.length - MAX_RECORD_CONTENT_CHARS;
-	return `${head} … [truncated ${dropped} chars]`;
-}
-
 function textAndPlaceholders(content: unknown, options: { includeThinking?: boolean } = {}): string {
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "[non-text content omitted]";

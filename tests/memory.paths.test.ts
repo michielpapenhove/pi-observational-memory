@@ -25,7 +25,7 @@ function writeTopic(filename: string, content: string): void {
 describe("resolveWithinMemory", () => {
 	it("resolves paths inside .memory/", () => {
 		expect(resolveWithinMemory(root, "auth.md")).toBe(join(root, "auth.md"));
-		expect(resolveWithinMemory(root, ".memory/auth.md")).toBe(join(root, ".memory", "auth.md"));
+		expect(resolveWithinMemory(root, ".memory/auth.md")).toBeUndefined();
 	});
 
 	it("rejects paths that escape the sandbox", () => {

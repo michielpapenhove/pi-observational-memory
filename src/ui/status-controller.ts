@@ -9,6 +9,7 @@
  *   - Toasts via notify (start/finish/error), gated on hasUI by the caller.
  */
 
+import type { WorkerActivity } from "../spawn/activity.js";
 export type WorkerType = "observer" | "consolidator";
 
 /** Live token gauges shown in the footer, right of "○ om". */
@@ -51,6 +52,8 @@ export interface StatusControllerOptions {
 }
 
 interface WorkerEntry {
+	startedAt: number;
+	activity?: WorkerActivity;
 	type: WorkerType;
 	state: WorkerState;
 	settleTimer?: ReturnType<typeof setTimeout>;
@@ -105,9 +108,14 @@ export class StatusController {
 		if (!this.ui) return;
 		const existing = this.workers.get(runId);
 		if (existing?.settleTimer) clearTimeout(existing.settleTimer);
-		this.workers.set(runId, { type, state: { kind: "running" } });
+		this.workers.set(runId, { type, state: { kind: "running" }, startedAt: Date.now() });
 		this.startSpinner();
 		this.renderWorkersWidget();
+	}
+
+	workerActivity(runId: string, activity: WorkerActivity): void {
+		const worker = this.workers.get(runId);
+		if (worker?.state.kind === "running") worker.activity = activity;
 	}
 
 	workerDone(runId: string, delta?: number): void {
@@ -201,7 +209,11 @@ export class StatusController {
 		const parts: string[] = [];
 		for (const entry of this.workers.values()) {
 			if (entry.state.kind === "running") {
-				parts.push(`${theme.fg("accent", SPINNER_FRAMES[this.frame])} ${theme.fg("accent", `[${entry.type}]`)}`);
+				const seconds = Math.max(0, Math.floor((Date.now() - entry.startedAt) / 1000));
+				const elapsed = `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2,"0")}s`;
+				const a = entry.activity;
+				const activity = a ? ` · ${a.writes} writes · ${a.tool}${a.error ? " failed" : ""} ${Math.max(0,Math.floor((Date.now()-a.at)/1000))}s ago` : " · awaiting activity";
+				parts.push(`${theme.fg("accent", SPINNER_FRAMES[this.frame])} ${theme.fg("accent", `[${entry.type}]`)} ${theme.fg("muted", elapsed + activity)}`);
 			} else if (entry.state.kind === "error") {
 				parts.push(`${theme.fg("error", "✗")} ${theme.fg("muted", `[${entry.type}]`)}`);
 			} else {

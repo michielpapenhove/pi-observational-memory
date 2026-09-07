@@ -28,8 +28,12 @@ export interface Config {
 	 * this, the consolidator compresses its oldest entries (recent history stays detailed).
 	 */
 	journeyTargetTokens: number;
-	/** Max simultaneous in-flight observer subprocesses. */
+	/** Legacy setting, ignored: this fork processes observer chunks serially. */
 	observerConcurrency: number;
+	workerTimeoutMs: number;
+	maxWorkerPromptBytes: number;
+	maxWorkerAttempts: number;
+	retryDelayMs: number;
 	models: {
 		observer: ConfiguredModel;
 		consolidator: ConfiguredModel;
@@ -54,7 +58,11 @@ export const DEFAULTS: Config = {
 	compactAtContextTokens: 150_000,
 	tailTokens: 20_000,
 	journeyTargetTokens: 1_000,
-	observerConcurrency: 4,
+	observerConcurrency: 1,
+	workerTimeoutMs: 15 * 60_000,
+	maxWorkerPromptBytes: 256 * 1024,
+	maxWorkerAttempts: 3,
+	retryDelayMs: 5_000,
 	resumeAfterMidRunCompaction: true,
 	models: {
 		observer: { provider: "openrouter", id: "z-ai/glm-5.3", thinking: "low" },
@@ -106,6 +114,10 @@ function normalizeSettingsConfig(value: Record<string, unknown>, base: Config): 
 		"tailTokens",
 		"journeyTargetTokens",
 		"observerConcurrency",
+		"workerTimeoutMs",
+		"maxWorkerPromptBytes",
+		"maxWorkerAttempts",
+		"retryDelayMs",
 	] as const;
 	for (const key of numberKeys) {
 		const normalizedValue = positiveIntegerOrUndefined(value[key]);
@@ -150,7 +162,8 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env): C
 	const globalPath = join(getAgentDir(), "settings.json");
 	const projectPath = join(cwd, ".pi", "settings.json");
 	const globalConfig = readNamespacedConfig(globalPath, DEFAULTS);
-	const projectConfig = readNamespacedConfig(projectPath, DEFAULTS);
+	const globalBase: Config = { ...DEFAULTS, ...globalConfig, models: { ...DEFAULTS.models, ...globalConfig.models } };
+	const projectConfig = readNamespacedConfig(projectPath, globalBase);
 	const envConfig = readEnvConfig(env);
 	return {
 		...DEFAULTS,

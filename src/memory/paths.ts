@@ -10,7 +10,8 @@
  *
  * All writes are atomic (temp + rename) so a reader never sees a half-written file.
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname, join, relative, resolve } from "node:path";
 
 export const INDEX_FILENAME = "INDEX.md";
@@ -33,6 +34,7 @@ export function memoryBaseDir(cwd: string): string {
  * (survives /name, /resume, /tree) — NOT the session filename or display name.
  */
 export function sessionMemoryRoot(cwd: string, sessionId: string): string {
+	if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(sessionId)) throw new Error("invalid session id");
 	return join(memoryBaseDir(cwd), sessionId);
 }
 
@@ -46,8 +48,8 @@ export function journeyPath(root: string): string {
 
 /** Read `.memory/JOURNEY.md` body, trimmed. Returns undefined when missing or effectively empty. */
 export function readJourney(root: string): string | undefined {
-	const path = journeyPath(root);
-	if (!existsSync(path)) return undefined;
+	const path = resolveWithinMemory(root, JOURNEY_FILENAME);
+	if (!path || !existsSync(path)) return undefined;
 	try {
 		const body = readFileSync(path, "utf-8").trim();
 		return body.length > 0 ? body : undefined;
@@ -59,9 +61,13 @@ export function readJourney(root: string): string | undefined {
 /** Atomic write (temp + rename). Creates parent dirs as needed. */
 export function atomicWrite(path: string, content: string): void {
 	mkdirSync(dirname(path), { recursive: true });
-	const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
-	writeFileSync(tmp, content, "utf-8");
-	renameSync(tmp, path);
+	const tmp = `${path}.tmp-${randomUUID()}`;
+	try {
+		writeFileSync(tmp, content, { encoding: "utf-8", mode: 0o600, flag: "wx" });
+		renameSync(tmp, path);
+	} finally {
+		rmSync(tmp, { force: true });
+	}
 }
 
 /**
@@ -70,11 +76,21 @@ export function atomicWrite(path: string, content: string): void {
  * this to reject any path outside `.memory/` (design risk 6).
  */
 export function resolveWithinMemory(root: string, requestedPath: string): string | undefined {
+	// Deliberately flat: exactly the files listTopics can discover. No path guessing.
+	if (requestedPath !== "." && !/^(?:[a-z0-9]+(?:-[a-z0-9]+)*\.md|INDEX\.md|JOURNEY\.md)$/.test(requestedPath)) return undefined;
 	const base = resolve(root);
 	const abs = resolve(base, requestedPath);
-	const rel = relative(base, abs);
-	if (rel === "" || rel === ".") return abs; // the session memory root itself
-	if (rel.startsWith("..") || resolve(base, rel) !== abs) return undefined;
+	// Root is supplied by the orchestrator, never the model. Check the session root,
+	// its .memory parent, and the file itself, including dangling symlinks.
+	for (const candidate of new Set([dirname(base), base, abs])) {
+		try {
+			const stat = lstatSync(candidate);
+			if (stat.isSymbolicLink()) return undefined;
+			if (candidate === abs && abs !== base && !stat.isFile()) return undefined;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+		}
+	}
 	return abs;
 }
 
@@ -134,7 +150,9 @@ export function listTopics(root: string): Topic[] {
 		if (!filename.endsWith(".md") || filename === INDEX_FILENAME || filename === JOURNEY_FILENAME) continue;
 		let content: string;
 		try {
-			content = readFileSync(join(root, filename), "utf-8");
+			const path = resolveWithinMemory(root, filename);
+			if (!path) continue;
+			content = readFileSync(path, "utf-8");
 		} catch {
 			continue;
 		}

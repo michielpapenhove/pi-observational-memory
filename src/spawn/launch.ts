@@ -11,7 +11,9 @@ import { mkdirSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import type { ConfiguredModel } from "../config.js";
-import { runCostPath, runResultPath } from "./runs.js";
+import { runCostPath, runResultPath, runsDir } from "./runs.js";
+import { atomicWrite } from "../memory/paths.js";
+import type { WorkerRequest } from "./receipt.js";
 
 /** Repo root = two levels up from src/spawn/. The shared agent extension lives at agent/index.ts. */
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -40,7 +42,8 @@ export function resolvePiBinary(): { command: string; baseArgs: string[] } {
 export function buildWorkerArgv(opts: {
 	model: ConfiguredModel;
 	sessionName: string;
-	kickoffPrompt: string;
+	/** For small callers/tests only. Real workers receive the recorded prompt via stdin. */
+	kickoffPrompt?: string;
 	agentExtensionPath?: string;
 }): string[] {
 	const pi = resolvePiBinary();
@@ -57,11 +60,12 @@ export function buildWorkerArgv(opts: {
 	if (opts.model.thinking) args.push("--thinking", opts.model.thinking);
 	args.push("-e", opts.agentExtensionPath ?? AGENT_EXTENSION_PATH);
 	args.push("-n", opts.sessionName);
-	args.push("-p", opts.kickoffPrompt);
+	args.push("-p");
+	if (opts.kickoffPrompt !== undefined) args.push(opts.kickoffPrompt);
 	return [pi.command, ...args];
 }
 
-export type WorkerExit = { code: number | null; signal: NodeJS.Signals | null; stderr: string };
+export type WorkerExit = { code: number | null; signal: NodeJS.Signals | null; stderr: string; timedOut?: boolean; aborted?: boolean };
 
 /**
  * Spawn a headless worker; resolve when it exits. Workers run in their master session's
@@ -75,32 +79,45 @@ export function spawnWorker(opts: {
 	cwd: string;
 	env: NodeJS.ProcessEnv;
 	signal?: AbortSignal;
+	input?: string;
+	timeoutMs?: number;
+	killGraceMs?: number;
 }): Promise<WorkerExit> {
+	if (opts.signal?.aborted) return Promise.resolve({ code: null, signal: null, stderr: "cancelled before spawn", aborted: true });
 	const [command, ...rest] = opts.argv;
 	mkdirSync(opts.cwd, { recursive: true });
 	return new Promise<WorkerExit>((resolvePromise) => {
-		const proc = spawn(command, rest, {
-			cwd: opts.cwd,
-			env: opts.env,
-			stdio: ["ignore", "ignore", "pipe"],
+		const proc = spawn(command, rest, { cwd: opts.cwd, env: opts.env, stdio: ["pipe", "ignore", "pipe"] });
+		let stderr = Buffer.alloc(0);
+		let closed = false;
+		let timedOut = false;
+		let aborted = false;
+		let escalation: ReturnType<typeof setTimeout> | undefined;
+		const stop = () => {
+			if (closed || escalation) return;
+			proc.kill("SIGTERM");
+			escalation = setTimeout(() => {
+				if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");
+			}, opts.killGraceMs ?? 3000);
+			escalation.unref?.();
+		};
+		const abort = () => { aborted = true; stop(); };
+		const deadline = setTimeout(() => { timedOut = true; stop(); }, opts.timeoutMs ?? 15 * 60_000);
+		deadline.unref?.();
+		opts.signal?.addEventListener("abort", abort, { once: true });
+		proc.stderr.on("data", (d: Buffer) => { stderr = Buffer.concat([stderr, d]).subarray(-16_384); });
+		proc.on("error", (error) => { stderr = Buffer.from(error.message).subarray(-16_384); });
+		proc.on("close", (code, signal) => {
+			closed = true;
+			clearTimeout(deadline);
+			if (escalation) clearTimeout(escalation);
+			opts.signal?.removeEventListener("abort", abort);
+			resolvePromise({ code, signal, stderr: stderr.toString(), timedOut, aborted });
 		});
-		let stderr = "";
-		proc.stderr?.on("data", (d: Buffer) => {
-			stderr += d.toString();
-		});
-		proc.on("error", () => resolvePromise({ code: 1, signal: null, stderr: stderr || "spawn error" }));
-		proc.on("close", (code, signal) => resolvePromise({ code, signal, stderr }));
-
-		if (opts.signal) {
-			const kill = () => {
-				proc.kill("SIGTERM");
-				setTimeout(() => {
-					if (!proc.killed) proc.kill("SIGKILL");
-				}, 3000).unref?.();
-			};
-			if (opts.signal.aborted) kill();
-			else opts.signal.addEventListener("abort", kill, { once: true });
-		}
+		// stdin remains a recorded Pi user message, without the OS argv length limit.
+		proc.stdin.on("error", () => {}); // EPIPE on early exit is reported by close.
+		proc.stdin.end(opts.input ?? "");
+		if (opts.signal?.aborted) abort();
 	});
 }
 
@@ -108,16 +125,19 @@ export type ObserverLaunchEnv = {
 	/** Absolute `.memory/<sessionId>/` root — IPC files and the consolidator sandbox live here. */
 	memoryRoot: string;
 	runId: string;
+	request?: WorkerRequest;
 };
 
 /**
- * Build the env a worker subprocess needs to write its result file. The chunk itself is NOT
- * passed via env/file — it is the `pi -p` prompt (recorded user message) so the run stays
- * faithfully inspectable on resume.
+ * Build per-run IPC configuration. The transcript is delivered on stdin as a recorded
+ * Pi user message, not in environment variables or an oversized argv argument.
  */
 export function buildWorkerEnv(role: "observer" | "consolidator", opts: ObserverLaunchEnv): NodeJS.ProcessEnv {
+	const requestPath = join(runsDir(opts.memoryRoot), `${opts.runId}.request.json`);
+	if (opts.request) atomicWrite(requestPath, JSON.stringify(opts.request));
 	return {
 		...process.env,
+		OM_REQUEST_PATH: requestPath,
 		OM_WORKER: role,
 		OM_RUN_ID: opts.runId,
 		OM_RESULT_PATH: runResultPath(opts.memoryRoot, opts.runId),

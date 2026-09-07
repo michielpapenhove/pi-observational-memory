@@ -1,139 +1,128 @@
-# observational-memory
+# Observational memory: Michiel's fork
 
-Tiered, subprocess-backed memory for pi.
+A Pi extension that compresses conversation chunks into observations, then promotes older observations into topic files. Based on [amosblomqvist/pi-observational-memory](https://github.com/amosblomqvist/pi-observational-memory), commit `78a1efc`.
 
-Parallel **observers** distill raw conversation chunks into atomic observations committed to the master's branch-local **ledger** (so memory stays correct under `/tree`); a deterministic, model-free **compaction** renders that buffer verbatim into the compaction block. A **consolidator** promotes the oldest observations into durable `.memory/<sessionId>/` topic files, bounding the buffer and giving each session its own durable, `grep`-able long-term memory (a fork seeds its memory from its parent).
+This fork prioritizes predictable source coverage and explicit completion. The upstream `PLAN.md` is historical design context, not the current contract.
 
-## On/off gate (default OFF)
+## Install
 
-The extension ships in the global extensions folder during development, so it is **gated off
-per session** and is completely invisible until you turn it on.
+Requires a working Pi installation with `pi` on PATH, Git, Node.js/npm, and SSH access to this private GitHub repository:
 
-- `/om` — toggle for this session
-- `/om on` / `/om off` — set explicitly
-
-State persists per session in the ledger (`om.enabled`) and survives resume. When off, every
-trigger, hook, widget, and subprocess returns immediately.
-
-## How it works
-
-```mermaid
-flowchart LR
-    A["raw chunks<br/><i>token-bounded, fixed slices</i>"]
-    B["parallel observers<br/><i>subprocess pi, headless</i>"]
-    C["observations<br/><i>{timestamp, content}</i>"]
-    D["master ledger<br/><i>branch-local, /tree-correct</i>"]
-    E["compaction block<br/><i>deterministic, model-free</i>"]
-    F["consolidator<br/><i>subprocess pi, one at a time</i>"]
-    G[".memory/&lt;session&gt;/&lt;topic&gt;.md + INDEX.md<br/><i>durable, per-session, grep-able;<br/>tombstones drain buffer</i>"]
-
-    A --> B --> C --> D --> E
-    D -- "oldest overflow<br/>(pool > consolidateAtPoolTokens)" --> F --> G
+```bash
+pi install git:git@github.com:michielpapenhove/pi-observational-memory.git
 ```
 
-Pipeline: raw chunks → observers → observations → ledger → compaction block, with a
-consolidator draining the oldest observations into durable per-session memory files.
+In Pi, run `/reload`, then `/om on` in a new session. Remove or disable any other installation of observational-memory first so the extension loads only once. See [Adoption](#adoption) when switching from upstream.
 
-- **Observer clock** (`turn_end` / `agent_start`): every `chunkTokens` of new raw history,
-  cut a fixed-token slice and fire an observer subprocess. Observers are embarrassingly
-  parallel pure mappers (capped by `observerConcurrency`); each commits its own
-  `coversUpToId` watermark, so out-of-order completion is fine.
-- **Observation** = `{ timestamp, content, tokenCount }`. The precise event-`timestamp`
-  doubles as the id; the orchestrator re-derives a unique, second-resolution id at commit
-  (the observer only emits minute resolution).
-- **Compaction** (`agent_end` over `compactAtContextTokens`, when idle): waits for in-flight
-  observers, then renders the active buffer plus a **memory map** (rendered live from
-  `.memory/<session>/` topic front-matter) and a **journey** section (`.memory/<session>/JOURNEY.md`, read
-  verbatim). The cutoff snaps to an observation chunk boundary so the verbatim tail is never
-  double-represented.
-- **Consolidator clock** (`turn_end` / `agent_start`): when the active observation pool
-  exceeds `consolidateAtPoolTokens`, a single background consolidator subprocess folds the
-  **oldest** observations (above `poolTargetTokens`) into durable `.memory/<session>/<topic>.md`
-  files, then the orchestrator tombstones exactly the observations it reports — draining the
-  buffer back toward target. Topic files are **scoped per session** (`.memory/<sessionId>/`,
-  keyed by the immutable session-header id, so two sessions in the same project never share
-  output) and track the session, not the branch: they are **not** rolled back by `/tree`. On a
-  fork/clone the new session's memory is **seeded once** from the parent (matching the ledger,
-  which already travels with the fork). The orchestrator owns `INDEX.md` and re-renders it from
-  topic front-matter after each run; the consolidator touches `<topic>.md` files plus
-  `JOURNEY.md`, via its own `read`/`write`/`edit`/`ls`/`grep` tools scoped to the session dir.
-- **Journey** (`.memory/<session>/JOURNEY.md`): a single, whole-project, purely **descriptive** prose
-  history of how the work got to its current state, maintained by the consolidator and pushed
-  into every compaction block for **orientation** (not recall, not instructions). It is
-  append-mostly: each consolidation adds a short dated segment and compresses the oldest
-  segments only once the file exceeds `journeyTargetTokens`, so recent history stays detailed
-  and the section stays bounded. Like the topic files it does **not** roll back under `/tree`.
+Worker models use the `observational-memory` namespace in `~/.pi/agent/settings.json`. For example, merge this section into your settings to use DeepSeek:
 
-Each worker is an **ordinary recorded pi session** in the global store
-(`~/.pi/agent/sessions`, under the project path) — open it in the session browser to see the
-exact input chunk, tool calls, and output. Transient handoff files live in
-`<project>/.memory/<sessionId>/.runs/`.
-
-### Cost tracking
-
-Every worker is a `pi` subprocess, so its spend is captured from pi's **built-in**
-`usage.cost.total` (reliable, already computed). The worker extension — *not* the model —
-accumulates that figure and hands it back via the run's cost file
-(`.memory/<session>/.runs/<runId>.cost.json`), alongside the existing observation IPC. The orchestrator
-folds each run into an `om.cost` ledger entry.
-
-- **Ephemeral-safe:** cost rides the result-file IPC, never a saved session log, so it works
-  even if a worker session is not persisted.
-- **Never rolls back:** the running total sums *all* `om.cost` entries across the whole
-  session (every branch), so real money spent does not decrease under `/tree` — the same
-  tier rule as the `.memory/` files.
-- **Surfaced** in the footer (`$0.000`, right of the gauges) and in `/om:status`
-  (`session cost: $X (N runs)`). Survives resume.
-
-## Commands
-
-| Command | Effect |
-|---|---|
-| `/om`, `/om on`, `/om off` | The per-session on/off gate |
-| `/om:status` | Workers in flight, active observation count, next-observer progress, pool/consolidator state, topic-file count, journey size, context usage, **session cost**, last error |
-| `/om:compact` | Force a compaction now (ignores the threshold) |
-| `/om:consolidate` | Force a consolidation now (ignores the pool threshold) |
-
-## Configuration
-
-Namespace `observational-memory` in `~/.pi/agent/settings.json` (global) or
-`.pi/settings.json` (project; overrides global):
-
-```jsonc
+```json
 {
   "observational-memory": {
-    "chunkTokens": 5000,
-    "chunkOverlapTokens": 0,
-    "poolTargetTokens": 10000,           // buffer drains back toward this after consolidation
-    "consolidateAtPoolTokens": 20000,    // pool size that triggers a consolidation (200% of target)
-    "compactAtContextTokens": 100000,    // tune per model
-    "tailTokens": 20000,                 // verbatim tail; snaps to a chunk boundary
-    "journeyTargetTokens": 1000,         // pushed JOURNEY.md size; compress oldest segments past this
-    "observerConcurrency": 4,
     "models": {
-      "observer":     { "provider": "anthropic", "id": "claude-sonnet-4-6", "thinking": "low" },
-      "consolidator": { "provider": "anthropic", "id": "claude-sonnet-4-6", "thinking": "medium" }
-    },
-    "passive": false,
-    "debugLog": false
+      "observer": { "provider": "deepseek", "id": "deepseek-v4-flash", "thinking": "high" },
+      "consolidator": { "provider": "deepseek", "id": "deepseek-v4-flash", "thinking": "high" }
+    }
   }
 }
 ```
 
-`PI_OM_PASSIVE=1` forces `passive` (disables all triggers) for clean `/tree` testing.
-`passive` is a power-user setting distinct from the on/off gate.
+Configure provider credentials locally in Pi; they are not part of this repository. Conversation chunks are sent to the configured worker providers, so choose providers permitted for your work data. Without overrides, the workers use the OpenRouter defaults listed below.
+
+To update later, stop OM and let workers exit, then run:
+
+```bash
+pi update --extension git:git@github.com:michielpapenhove/pi-observational-memory.git
+```
+
+Run `/reload` and `/om on` afterward. Updating this fork does not require discarding its existing sessions or memories.
+
+## Pipeline
+
+1. One observer at a time reads a source chunk. Its final `record_observations` call must set `complete:true`, including for zero-observation chunks.
+2. Only a normal worker ending with a valid run-bound receipt advances the branch-local ledger. A failed chunk remains next in line; later chunks cannot jump over it.
+3. One consolidator may run alongside the observer. It folds the oldest observations into flat topic files.
+4. Its final `complete_consolidation` call accounts for **every** supplied observation with a topic filename or explicit discard reason. Existing facts can reference an unchanged topic; needless rewrites are not required.
+5. A rejected consolidator confirmation lists missing, unknown and duplicate IDs. The worker may resubmit a full corrected array, with up to three correction opportunities. These precisely tracked validation errors do not invalidate a subsequently accepted confirmation. Other tool errors stop the worker immediately. The worker extension writes a success receipt only after a normal final model stop without unrecovered model/tool failures. The master checks the receipt identity, all dispositions, referenced topic metadata/body and content hashes before removing the batch from the buffer.
+6. Compaction uses only confirmed chunk boundaries. Without one, it cancels rather than replacing unobserved history with an empty summary. With observer backlog, it can retain a larger raw tail than requested.
+
+Receipts verify bookkeeping and file bytes, **not semantic completeness**. A model can still summarize poorly or wrongly classify a fact as noise. This is not a lossless database.
+
+## Storage and path rules
+
+```
+<project>/.memory/<immutable-session-id>/
+  INDEX.md          # master-generated, project-relative links
+  JOURNEY.md        # short descriptive history
+  auth.md           # flat topic, required front-matter
+  user-profile.md
+  .runs/            # per-run request, completion, activity and cost files
+```
+
+The master sees project-relative paths such as `.memory/<id>/auth.md`. Worker tools see **only bare filenames** such as `auth.md`. The worker prompt renders its own root-relative index. Directories, absolute paths, hidden files, `.memory/` prefixes, and symlink files/root are rejected. `grep` is literal text search, not regex. Files are limited to 512 KiB; oversized reads fail explicitly instead of silently truncating them.
+
+Topic files require `id` (matching the filename stem), `title`, `summary`, `updated`, and a nonempty body. Filenames are lowercase kebab-case with `.md`. `INDEX.md` cannot be edited by the worker; `JOURNEY.md` has no front-matter and cannot stand in for a topic in a completion receipt.
+
+Writes use a unique temporary file plus rename, with owner-only file permissions. This is **atomic per file, not a multi-file transaction**. A failed run may have updated some topics; the source observations stay available for retry. Failed workers write a failure receipt with the cause, never an acknowledgement. Missing receipts produce a readable incomplete-run error rather than a raw ENOENT. There is no journal, migration framework or automatic duplicate-tree merge. Files are session-scoped but intentionally not rolled back by `/tree`.
+
+## Commands
+
+- `/om`, `/om on`, `/om off`: session-local gate, default off.
+- `/om:status`: coverage, pool, attempts, memory root, costs and last error.
+- `/om:compact`: request compaction.
+- `/om:consolidate`: manual consolidation, bypassing threshold/backoff/attempt limit, but not an active run.
+
+The footer retains O/C/X gauges and cost. Running worker widgets show elapsed time, successful write/edit operations, last tool and age of that activity. Elapsed time is not proof of progress; “awaiting activity” can mean the model is thinking or waiting on its provider.
+
+## Failure and lifecycle rules
+
+- Deadline: 15 minutes by default, then SIGTERM and SIGKILL after a three-second grace if the process has not exited.
+- stderr retains only the last 16 KiB.
+- Prompts use stdin, still recorded as real Pi user messages. No large transcript in argv.
+- Input exceeding `maxWorkerPromptBytes` blocks that role with an explicit `/om:status` reason and one UI notice. It does not consume retries or advance coverage. Nothing is silently truncated. Increase the limit only if the configured model has room, then `/reload`, or leave OM off for that session. A manual consolidator retry can recheck a changed batch/file.
+- Retries occur on a later `agent_start`/`turn_end`, after exponential backoff. There is no idle retry daemon. After three consecutive failures the role stops automatically retrying. `/om off` then `/om on` resets attempts; `/om:consolidate` also allows a manual consolidator retry.
+- Off, navigation, session replacement and shutdown invalidate asynchronous callbacks. Ordinary new turns do not. Aborted workers retain their occupied slots until process close, so a quick off/on cannot overlap two consolidators writing the same files.
+- Run cost files are best-effort, including partial runs. Late results from a replaced runtime are not appended to the new session; their cost evidence remains in `.runs/`.
+- Background workers are ordinary recorded Pi sessions, with no tools outside their dedicated tool belt. No worker receives the main session's skills, extensions or context files.
+
+The sandbox assumes a trusted local project/root and no hostile concurrent filesystem replacement. It prevents model-selected traversal and existing symlinks; it is not an OS security boundary against another local process.
+
+## Settings
+
+Namespace `observational-memory` in global or project Pi settings:
+
+| Setting | Default |
+|---|---:|
+| `chunkTokens` | 10000 |
+| `poolTargetTokens` | 10000 |
+| `consolidateAtPoolTokens` | 15000 |
+| `compactAtContextTokens` | 150000 |
+| `tailTokens` | 20000 |
+| `journeyTargetTokens` | 1000 |
+| `workerTimeoutMs` | 900000 |
+| `maxWorkerPromptBytes` | 262144 |
+| `maxWorkerAttempts` | 3 |
+| `retryDelayMs` | 5000 |
+| `resumeAfterMidRunCompaction` | true |
+| `passive` | false |
+| `debugLog` | false |
+
+`models.observer` and `models.consolidator` retain their provider/id/thinking configuration. Defaults are `openrouter/z-ai/glm-5.3` with low/medium thinking. `PI_OM_PASSIVE=1` disables automatic work. The legacy `observerConcurrency` setting is ignored: this fork uses one observer. `chunkOverlapTokens` is legacy and does not implement overlap.
+
+When `debugLog` is enabled, worker start/confirmed/failed/blocked records go to `~/.pi/agent/observational-memory/debug/<session-id>.ndjson`, rotated at 10 MiB. Logs contain run IDs and counts, not prompts. Full worker conversation recordings stay in Pi's session store. IPC files are currently retained; there is no automatic cleanup policy.
 
 ## Development
 
-```bash
-npm install
-npm test          # vitest
-npm run typecheck # tsc --noEmit
+```
+npm ci --ignore-scripts
+npm test
+npm run typecheck
 ```
 
-Layout: `src/` is the master-side orchestrator (entry `src/index.ts`); `agent/` is the shared
-worker extension loaded into subprocesses via `-e` (`OM_WORKER=observer|consolidator`).
-Long-term memory lives under `<project>/.memory/<sessionId>/` (`INDEX.md` + `<topic>.md` +
-`JOURNEY.md`), keyed by the immutable session-header id so sessions in the same project stay
-isolated; a fork seeds its dir from the parent's on first touch. Transient worker IPC lives
-under `<project>/.memory/<sessionId>/.runs/`.
+Tests use temporary directories, mocked model workers and real dummy Node processes for deadline/stdin tests. They make no model calls and do not alter the installed extension, user sessions or project memories. Regression coverage includes path/index agreement, symlinks, strict receipts, malformed output, retry coverage, zero-observation completion, late callbacks, unsafe compaction, input limits and TERM/KILL escalation.
+
+## Adoption
+
+Do not replace code underneath running workers. Stop OM in active sessions and let workers exit before installing/reloading the fork.
+
+When switching from upstream, start with **new Pi sessions and empty OM memory**. Old OM ledgers may contain invalid coverage and old topic trees can be duplicated; this fork does not repair or certify them. Existing ordinary Pi conversation logs need not be deleted. Removing old `.memory/` files while resuming an old OM-enabled session is unsafe: its ledger may already have dropped observations in favor of those files. No automatic migration or deletion is performed.

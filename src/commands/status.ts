@@ -26,7 +26,12 @@ export function registerStatusCommand(pi: ExtensionAPI, runtime: Runtime): void 
 
 			const lines = [
 				`om status`,
-				`  observers in flight: ${runtime.observersInFlight.size} / ${runtime.config.observerConcurrency}`,
+				`  observers in flight: ${runtime.observersInFlight.size} / 1 (serial)`,
+				runtime.observerBlocked ? `  observer BLOCKED: ${runtime.observerBlocked}` : `  observer input: ready`,
+				runtime.consolidatorBlocked ? `  consolidator BLOCKED: ${runtime.consolidatorBlocked}` : `  consolidator input: ready`,
+				`  failed attempts: observer ${runtime.observerFailures}, consolidator ${runtime.consolidatorFailures} (limit ${runtime.config.maxWorkerAttempts})`,
+				`  worker deadline: ${runtime.config.workerTimeoutMs / 60_000} min; retries on next turn/start after backoff`,
+				`  memory root: ${runtime.memoryRoot}`,
 				`  active observations: ${folded.activeObservations.length}`,
 				`  next observer: ${sinceObservation.toLocaleString()} / ${runtime.config.chunkTokens.toLocaleString()} tok`,
 				`  pool: ${pool.toLocaleString()} tok (target ${runtime.config.poolTargetTokens.toLocaleString()}, consolidate at ${runtime.config.consolidateAtPoolTokens.toLocaleString()})`,

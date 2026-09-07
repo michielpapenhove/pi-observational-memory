@@ -13,8 +13,7 @@ coverage/
 
 # Environment
 .env
-.env.local
-.env.*.local
+.env.*
 
 # macOS
 .DS_Store
@@ -30,3 +29,6 @@ coverage/
 npm-debug.log*
 
 .memory/
+
+# Local review history and installation notes
+REVIEW-NOTES.md

@@ -57,6 +57,7 @@ export type Observation = {
 };
 
 export type ObservationsRecordedEntryData = {
+	complete?: true;
 	observations: Observation[];
 	coversUpToId: string;
 };
@@ -111,7 +112,7 @@ export function isObservationsRecordedData(value: unknown): value is Observation
 	if (!isPlainRecord(value)) return false;
 	return (
 		Array.isArray(value.observations) &&
-		value.observations.length > 0 &&
+		(value.observations.length > 0 || value.complete === true) &&
 		value.observations.every(isObservation) &&
 		isNonEmptyString(value.coversUpToId)
 	);

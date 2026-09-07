@@ -32,15 +32,7 @@ export function registerConsolidateCommand(pi: ExtensionAPI, runtime: Runtime): 
 				}
 				return;
 			}
-			// Temporarily lower the threshold to 0 for this evaluation so the trigger fires
-			// regardless of the configured pool threshold.
-			const saved = runtime.config.consolidateAtPoolTokens;
-			runtime.config.consolidateAtPoolTokens = 0;
-			try {
-				evaluateConsolidatorTrigger(pi, runtime, ctx);
-			} finally {
-				runtime.config.consolidateAtPoolTokens = saved;
-			}
+			evaluateConsolidatorTrigger(pi, runtime, ctx, true);
 		},
 	});
 }
