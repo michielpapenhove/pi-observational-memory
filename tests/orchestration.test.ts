@@ -77,6 +77,25 @@ it('exit zero without a receipt retains the entire consolidation batch',async()=
  evaluateConsolidatorTrigger(pi,runtime,ctx); await finishConsolidator(runtime);
  expect(pi.appendEntry).not.toHaveBeenCalled(); expect(runtime.consolidatorFailures).toBe(1);
 });
+it.each([1,3])('failure notice explains automatic retries at attempt %s and retains the batch',async(attempt)=>{
+ const {runtime,branch,pi,ctx}=setup();
+ runtime.consolidatorFailures=attempt-1;
+ ctx.hasUI=true;ctx.ui={notify:vi.fn()};
+ branch.push(observationsRecordedEntry('obs',{observations:[observation('one'),observation('two')],coversUpToId:'a'}));
+ vi.mocked(spawnWorker).mockImplementationOnce(async opts=>{
+  const request=readRequest(opts.env.OM_REQUEST_PATH!);
+  writeFailure(runResultPath(opts.cwd,request.runId),request,'edit failed: oldText not found');
+  return {...exit,code:1};
+ });
+ evaluateConsolidatorTrigger(pi,runtime,ctx);await finishConsolidator(runtime);
+ expect(pi.appendEntry).not.toHaveBeenCalled();
+ const notice=ctx.ui.notify.mock.calls.at(-1)[0];
+ expect(notice).toContain(`Attempt ${attempt}/3`);
+ expect(notice).toContain('Observations retained');
+ expect(notice).toContain('/om:consolidate');
+ expect(notice).toContain(attempt===3?'Automatic retry limit reached':'Automatic retry on a later turn after backoff');
+ expect(notice).not.toContain('Error: edit failed');
+});
 it('confirmed consolidation does not drop observations arriving during the run',async()=>{
  const {runtime,branch,pi,ctx} = setup();
  branch.push(observationsRecordedEntry('obs',{observations:[observation('one'),observation('two')],coversUpToId:'a'}));

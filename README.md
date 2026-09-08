@@ -43,7 +43,7 @@ Run `/reload` and `/om on` afterward. Updating this fork does not require discar
 2. Only a normal worker ending with a valid run-bound receipt advances the branch-local ledger. A failed chunk remains next in line; later chunks cannot jump over it.
 3. One consolidator may run alongside the observer. It folds the oldest observations into flat topic files.
 4. Its final `complete_consolidation` call accounts for **every** supplied observation with a topic filename or explicit discard reason. Existing facts can reference an unchanged topic; needless rewrites are not required.
-5. A rejected consolidator confirmation lists missing, unknown and duplicate IDs. The worker may resubmit a full corrected array, with up to three correction opportunities. These precisely tracked validation errors do not invalidate a subsequently accepted confirmation. Other tool errors stop the worker immediately. The worker extension writes a success receipt only after a normal final model stop without unrecovered model/tool failures. The master checks the receipt identity, all dispositions, referenced topic metadata/body and content hashes before removing the batch from the buffer.
+5. A rejected consolidator confirmation lists missing, unknown and duplicate IDs. The worker may resubmit a full corrected array, with up to three correction opportunities. An edit rejected because `oldText` is missing or ambiguous also allows up to three correction opportunities across the run, with a separate budget. The rejection changes no bytes and instructs the worker to reread the file and copy an exact unique substring; matching stays strict, without fuzzy replacement. These precisely tracked errors do not invalidate a subsequently accepted confirmation. A fourth edit mismatch, any other edit/read/write failure, or an edit after accepted completion stops the worker immediately. The worker extension writes a success receipt only after a normal final model stop without unrecovered model/tool failures. The master checks the receipt identity, all dispositions, referenced topic metadata/body and content hashes before removing the batch from the buffer.
 6. Compaction uses only confirmed chunk boundaries. Without one, it cancels rather than replacing unobserved history with an empty summary. With observer backlog, it can retain a larger raw tail than requested.
 
 Receipts verify bookkeeping and file bytes, **not semantic completeness**. A model can still summarize poorly or wrongly classify a fact as noise. This is not a lossless database.
@@ -125,7 +125,7 @@ npm test
 npm run typecheck
 ```
 
-Tests use temporary directories, mocked model workers and real dummy Node processes for deadline/stdin tests. They make no model calls and do not alter the installed extension, user sessions or project memories. Regression coverage includes path/index agreement, symlinks, strict receipts, malformed output, retry coverage, zero-observation completion, late callbacks, unsafe compaction, input limits and TERM/KILL escalation.
+Tests use temporary directories, mocked model workers and real dummy Node processes for deadline/stdin tests. They make no model calls and do not alter the installed extension, user sessions or project memories. Regression coverage includes path/index agreement, symlinks, strict receipts, malformed output, bounded exact-match edit recovery, independent edit/confirmation correction budgets, retry notices, zero-observation completion, late callbacks, unsafe compaction, input limits and TERM/KILL escalation.
 
 ## Adoption
 

@@ -7,7 +7,7 @@ You operate entirely inside the session memory root. Scoped tools read, write, e
 How you work:
 1. Run ls to see existing topic files, and read the ones relevant to the incoming observations.
 2. For each incoming observation, decide where it belongs: an existing topic file, or a new one.
-3. Write/edit topic files so each holds clean, current-state prose about its topic.
+3. Write/edit topic files so each holds clean, current-state prose about its topic. For edit, copy oldText exactly from the file you read; never paraphrase or omit words. Prefer a short unique substring. A missing or ambiguous match changes nothing: read that file again and retry with exact current text. You have at most three edit correction opportunities across the whole run, separate from confirmation corrections.
 4. Update JOURNEY.md (see below) with a short segment covering this batch.
 5. Call complete_consolidation with one disposition per incoming observation timestamp: {timestamp,path} for a stored or already represented fact, or {timestamp,reason} for explicitly discarded noise. Then emit a one-sentence confirmation and stop.
 
@@ -46,4 +46,4 @@ Completion:
 - complete_consolidation is mandatory and must account for EVERY input timestamp exactly once. Refer only to valid topic files, not INDEX.md or JOURNEY.md. Existing files can count if the fact is already represented; never rewrite files just to prove activity.
 - After completion, make no more tool calls. Finish with a one-sentence confirmation.
 - If complete_consolidation is rejected, read the missing/unknown/duplicate IDs in its error and resubmit the FULL corrected array. You have up to three correction opportunities. Do not repeat the same rejected array. Rejection is not acceptance; all observations stay buffered until completion succeeds.
-- Other tool errors or exhausted correction attempts stop the run and keep the entire batch for retry. File writes are atomic per file, not a multi-file transaction; retries must merge carefully and avoid duplicating existing facts.`;
+- Only missing/ambiguous edit matches and rejected confirmations have bounded correction opportunities. All other tool errors or exhausted correction attempts stop the run and keep the entire batch for retry. File writes are atomic per file, not a multi-file transaction; retries must merge carefully and avoid duplicating existing facts.`;

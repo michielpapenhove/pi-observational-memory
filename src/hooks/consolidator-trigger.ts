@@ -75,7 +75,12 @@ async function dispatch(pi: ExtensionAPI,runtime: Runtime,ctx: TriggerCtx,promot
   runtime.consolidatorRetryAt = Date.now() + config.retryDelayMs * 2 ** (runtime.consolidatorFailures-1);
   runtime.lastWorkerError = String(error);
   runtime.status.workerError(runId);
-  if (ctx.hasUI) ctx.ui?.notify(`om: ${String(error)}. Observations retained. Attempt ${runtime.consolidatorFailures}/${config.maxWorkerAttempts}; /om:consolidate retries manually.`, 'error');
+  if (ctx.hasUI) {
+   const retry = runtime.consolidatorFailures < config.maxWorkerAttempts
+    ? 'Automatic retry on a later turn after backoff; /om:consolidate retries manually.'
+    : 'Automatic retry limit reached; /om:consolidate retries manually.';
+   ctx.ui?.notify(`om: ${error instanceof Error ? error.message : String(error)}. Observations retained. Attempt ${runtime.consolidatorFailures}/${config.maxWorkerAttempts}. ${retry}`, 'error');
+  }
  } finally {
   stopMonitoring();
   if (runtime.consolidatorController === controller) {

@@ -6,6 +6,11 @@ import { atomicWrite, resolveWithinMemory } from '../../src/memory/paths.js';
 import { validateDispositions, type Disposition, type WorkerRequest } from '../../src/spawn/receipt.js';
 
 const MAX_FILE_BYTES = 512 * 1024;
+const MAX_EDIT_CORRECTIONS = 3;
+/** Only an exact-match rejection before mutation is safe to recover here. */
+class EditMatchError extends Error {
+ constructor(readonly path: string, message: string) { super(message); }
+}
 const pathSchema = Type.String({ description: "Bare filename in this session's memory root, e.g. auth.md. No directories or .memory/ prefix." });
 const text = (value: string, isError = false) => ({ content: [{ type: 'text' as const, text: value }], details: {}, isError });
 
@@ -15,6 +20,7 @@ export function registerConsolidatorTools(pi: ExtensionAPI, memoryRoot: string, 
  let failed = false;
  let fatalError: string | undefined;
  let correctionAttempts = 0;
+ let editCorrectionAttempts = 0;
  const recoverableErrors = new Set<string>();
  let completed: Disposition[] | undefined;
  const pathFor = (path: string) => {
@@ -33,6 +39,11 @@ export function registerConsolidatorTools(pi: ExtensionAPI, memoryRoot: string, 
     if (failed) throw new Error('this run had tool errors; keep observations and retry the run');
     return text(run(p));
    } catch (error) {
+    if (name === 'edit' && error instanceof EditMatchError && !failed && !completed && editCorrectionAttempts < MAX_EDIT_CORRECTIONS) {
+     editCorrectionAttempts++;
+     recoverableErrors.add(_id);
+     throw new Error(`${error.message} in ${error.path}. No file changes. Read ${error.path} again and copy an exact unique substring from the current contents before retrying. Edit correction ${editCorrectionAttempts}/${MAX_EDIT_CORRECTIONS}; another mismatch after this budget stops the run.`);
+    }
     // A rejected candidate ACK changed no files and committed no coverage. Let the model repair it.
     if (name === 'complete_consolidation' && !failed && !completed && correctionAttempts < 3) {
      correctionAttempts++;
@@ -41,9 +52,10 @@ export function registerConsolidatorTools(pi: ExtensionAPI, memoryRoot: string, 
     }
     failed = true;
     completed = undefined;
+    const cause = error instanceof Error ? error.message : String(error);
     fatalError = name === 'complete_consolidation'
-     ? `confirmation failed; correction limit reached or run already failed: ${String(error)}`
-     : `${name} failed: ${String(error)}`;
+     ? `confirmation failed; correction limit reached or run already failed: ${cause}`
+     : `${name} failed: ${error instanceof EditMatchError ? 'edit correction limit reached: ' : ''}${cause}`;
     throw new Error(fatalError);
    }
   } });
@@ -63,11 +75,11 @@ export function registerConsolidatorTools(pi: ExtensionAPI, memoryRoot: string, 
  register('write', 'Atomically write a memory file. Preserve existing facts. Never write INDEX.md.', Type.Object({ path: pathSchema, content: Type.String() }), p => {
   write(p.path, p.content); return `Wrote ${p.path} (${Buffer.byteLength(p.content)} bytes).`;
  });
- register('edit', 'Replace one exact unique substring, atomically.', Type.Object({ path: pathSchema, oldText: Type.String({ minLength: 1 }), newText: Type.String() }), p => {
+ register('edit', 'Replace one exact unique substring, atomically. On a missing or ambiguous match, read the file again and retry with exact current text; at most three correction opportunities per run.', Type.Object({ path: pathSchema, oldText: Type.String({ minLength: 1 }), newText: Type.String() }), p => {
   writable(p.path);
   if (!p.oldText) throw new Error('oldText must not be empty');
   const before = read(p.path), count = before.split(p.oldText).length - 1;
-  if (count !== 1) throw new Error(count ? 'oldText is ambiguous' : 'oldText not found');
+  if (count !== 1) throw new EditMatchError(p.path, count ? 'oldText is ambiguous' : 'oldText not found');
   // Literal splice: replacement text must not interpret $&, $`, $\' as replace tokens.
   const index = before.indexOf(p.oldText);
   write(p.path, before.slice(0,index) + p.newText + before.slice(index + p.oldText.length));
