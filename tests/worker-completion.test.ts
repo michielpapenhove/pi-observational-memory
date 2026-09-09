@@ -7,11 +7,11 @@ import { makeRequest, readReceipt } from '../src/spawn/receipt.js';
 import { runResultPath } from '../src/spawn/runs.js';
 const dirs:string[]=[];
 afterEach(()=>{vi.unstubAllEnvs();dirs.splice(0).forEach(d=>rmSync(d,{recursive:true,force:true}));});
-function setup() {
+function setup(role:'observer'|'consolidator'='consolidator') {
  const root=mkdtempSync(join(tmpdir(),'om-worker-fix-'));dirs.push(root);
- const request=makeRequest('cons-test','consolidator','input',['a','b']);
+ const request=makeRequest(role==='observer'?'obs-test':'cons-test',role,'input',['a','b']);
  const requestPath=join(root,'request.json');writeFileSync(requestPath,JSON.stringify(request));
- for(const [k,v] of Object.entries({OM_WORKER:'consolidator',OM_RUN_ID:request.runId,OM_MEMORY_DIR:root,OM_REQUEST_PATH:requestPath,OM_RESULT_PATH:runResultPath(root,request.runId),OM_COST_PATH:join(root,'cost.json')}))vi.stubEnv(k,v);
+ for(const [k,v] of Object.entries({OM_WORKER:role,OM_RUN_ID:request.runId,OM_MEMORY_DIR:root,OM_REQUEST_PATH:requestPath,OM_RESULT_PATH:runResultPath(root,request.runId),OM_COST_PATH:join(root,'cost.json')}))vi.stubEnv(k,v);
  const tools=new Map<string,any>(),handlers=new Map<string,any[]>();
  const pi:any={registerTool:(t:any)=>tools.set(t.name,t),on:(name:string,h:any)=>handlers.set(name,[...handlers.get(name)??[],h])};
  const ctx={abort:vi.fn(),shutdown:vi.fn()};
@@ -24,7 +24,9 @@ function setup() {
   await emit('tool_execution_end',{toolCallId:id,toolName:name,isError});return isError;
  };
  const end=async(stopReason='stop')=>{messages.push({role:'assistant',stopReason});await emit('agent_end',{messages});};
- return {root,request,ctx,call,end};
+ // pi rejects a schema-invalid tool call before execute(): toolResult with isError plus tool_execution_end.
+ const reject=async(id:string,name:string)=>{messages.push({role:'toolResult',toolCallId:id,toolName:name,isError:true});await emit('tool_execution_end',{toolCallId:id,toolName:name,isError:true});};
+ return {root,request,ctx,call,end,emit,reject};
 }
 it('the real worker factory accepts a corrected confirmation after an earlier rejected tool call',async()=>{
  const {root,request,ctx,call,end}=setup();
@@ -89,4 +91,18 @@ it('exhausting correction attempts aborts without submitting success',async()=>{
  for(let i=0;i<4;i++)await call(`try-${i}`,'complete_consolidation',{dispositions:[]});
  expect(ctx.abort).toHaveBeenCalledOnce();await end();
  expect(()=>readReceipt(root,request)).toThrow('correction limit');
+});
+it('an observer tool rejection is correctable and does not abort the run',async()=>{
+ const {root,request,ctx,call,end,reject}=setup('observer');
+ await reject('bad','record_observations');
+ expect(ctx.abort).not.toHaveBeenCalled();
+ expect(await call('good','record_observations',{complete:true,observations:[{timestamp:'2026-09-09 12:30',content:'corrected observation'}]})).toBe(false);
+ await end();
+ expect(readReceipt(root,request).observations).toHaveLength(1);
+});
+it('an uncorrected observer rejection still fails without a completion receipt',async()=>{
+ const {root,request,call,end,reject}=setup('observer');
+ await reject('bad','record_observations');
+ await end();
+ expect(()=>readReceipt(root,request)).toThrow('no accepted completion');
 });

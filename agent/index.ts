@@ -22,6 +22,9 @@ export default function omWorker(pi: ExtensionAPI): void {
  pi.on('tool_execution_end', (event, ctx) => {
   if (!event.isError && ['write','edit'].includes(event.toolName)) writes++;
   writeActivity(root,{runId:request.runId,tool:event.toolName,writes,at:Date.now(),error:event.isError});
+  // Observer rejections (schema validation, blank observations, duplicate post-completion calls)
+  // are correctable: pi hands the error back and the model may resubmit before ending the run.
+  if (role === 'observer' && event.isError && event.toolName === 'record_observations') recoverableErrors.add(event.toolCallId);
   if (event.isError && !recoverableErrors.has(event.toolCallId)) {
    terminalFailure = consolidator?.failure() ?? `${event.toolName} failed; worker stopped without committing observations`;
    try { writeFailure(resultPath,request,terminalFailure); }

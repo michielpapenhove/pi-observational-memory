@@ -84,6 +84,6 @@ export function cleanWorkerEnd(event: any, recoverableErrors: ReadonlySet<string
  const messages: any[] = event?.messages ?? [];
  const lastAssistant = [...messages].reverse().find(m => m.role === 'assistant');
  return lastAssistant?.stopReason === 'stop' && !messages.some(m =>
-  (m.role === 'toolResult' && m.isError && !(['complete_consolidation','edit'].includes(m.toolName) && recoverableErrors.has(m.toolCallId))) ||
+  (m.role === 'toolResult' && m.isError && !(['complete_consolidation','edit','record_observations'].includes(m.toolName) && recoverableErrors.has(m.toolCallId))) ||
   (m.role === 'assistant' && ['error','aborted','length'].includes(m.stopReason)));
 }
