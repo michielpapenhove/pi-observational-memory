@@ -25,6 +25,8 @@ export default function omWorker(pi: ExtensionAPI): void {
   // Observer rejections (schema validation, blank observations, duplicate post-completion calls)
   // are correctable: pi hands the error back and the model may resubmit before ending the run.
   if (role === 'observer' && event.isError && event.toolName === 'record_observations') recoverableErrors.add(event.toolCallId);
+  // Schema-invalid arguments are rejected before execute(), so they never reach the tool's own budgets.
+  if (consolidator && event.isError) consolidator.noteRejectedCall(event.toolName, event.toolCallId);
   if (event.isError && !recoverableErrors.has(event.toolCallId)) {
    terminalFailure = consolidator?.failure() ?? `${event.toolName} failed; worker stopped without committing observations`;
    try { writeFailure(resultPath,request,terminalFailure); }

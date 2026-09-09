@@ -23,6 +23,18 @@ export function registerConsolidatorTools(pi: ExtensionAPI, memoryRoot: string, 
  let editCorrectionAttempts = 0;
  const recoverableErrors = new Set<string>();
  let completed: Disposition[] | undefined;
+ /** Three edit mismatches and three confirmation rejections, counted independently. */
+ const claimCorrection = (name: 'edit' | 'complete_consolidation'): boolean => {
+  if (failed || completed) return false;
+  if (name === 'edit') {
+   if (editCorrectionAttempts >= MAX_EDIT_CORRECTIONS) return false;
+   editCorrectionAttempts++;
+   return true;
+  }
+  if (correctionAttempts >= 3) return false;
+  correctionAttempts++;
+  return true;
+ };
  const pathFor = (path: string) => {
   const absolute = resolveWithinMemory(root, path);
   if (!absolute) throw new Error('path escapes .memory/ or is not a bare topic filename (symlinks forbidden)');
@@ -39,14 +51,12 @@ export function registerConsolidatorTools(pi: ExtensionAPI, memoryRoot: string, 
     if (failed) throw new Error('this run had tool errors; keep observations and retry the run');
     return text(run(p));
    } catch (error) {
-    if (name === 'edit' && error instanceof EditMatchError && !failed && !completed && editCorrectionAttempts < MAX_EDIT_CORRECTIONS) {
-     editCorrectionAttempts++;
+    if (name === 'edit' && error instanceof EditMatchError && claimCorrection('edit')) {
      recoverableErrors.add(_id);
      throw new Error(`${error.message} in ${error.path}. No file changes. Read ${error.path} again and copy an exact unique substring from the current contents before retrying. Edit correction ${editCorrectionAttempts}/${MAX_EDIT_CORRECTIONS}; another mismatch after this budget stops the run.`);
     }
     // A rejected candidate ACK changed no files and committed no coverage. Let the model repair it.
-    if (name === 'complete_consolidation' && !failed && !completed && correctionAttempts < 3) {
-     correctionAttempts++;
+    if (name === 'complete_consolidation' && claimCorrection('complete_consolidation')) {
      recoverableErrors.add(_id);
      throw error;
     }
@@ -111,5 +121,21 @@ export function registerConsolidatorTools(pi: ExtensionAPI, memoryRoot: string, 
   completed = validateDispositions(root, request.ids, p.dispositions);
   return 'Completion recorded. Make no more tool calls. Reply with a one-sentence confirmation.';
  });
- return { result: () => failed || !completed ? undefined : { dispositions: completed }, recoverableErrors, failure: () => fatalError };
+ /**
+  * pi rejects schema-invalid arguments before execute() runs, so those never reach the budgets
+  * above. Charge them to the same budget so a malformed call is correctable like a mismatch, and
+  * record why the run dies when no budget is left.
+  */
+ const noteRejectedCall = (toolName: string, toolCallId: string): boolean => {
+  if (recoverableErrors.has(toolCallId)) return true;
+  if (toolName !== 'edit' && toolName !== 'complete_consolidation') return false;
+  if (claimCorrection(toolName)) { recoverableErrors.add(toolCallId); return true; }
+  fatalError ??= completed
+   ? `${toolName} was called after completion was already submitted`
+   : failed
+    ? `${toolName} was rejected before execution after the run had already failed`
+    : `${toolName} was rejected before execution (invalid arguments); correction budget exhausted`;
+  return false;
+ };
+ return { result: () => failed || !completed ? undefined : { dispositions: completed }, recoverableErrors, failure: () => fatalError, noteRejectedCall };
 }

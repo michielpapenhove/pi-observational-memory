@@ -106,3 +106,22 @@ it('an uncorrected observer rejection still fails without a completion receipt',
  await end();
  expect(()=>readReceipt(root,request)).toThrow('no accepted completion');
 });
+it('a consolidator schema rejection is correctable and does not abort the run',async()=>{
+ const {root,request,ctx,call,end,reject}=setup();
+ writeFileSync(join(root,'facts.md'),'---\nid: facts\ntitle: Facts\nsummary: Test facts\nupdated: today\n---\nOriginal fact.\n');
+ await reject('bad','edit');
+ expect(ctx.abort).not.toHaveBeenCalled();
+ expect(await call('repair','edit',{path:'facts.md',oldText:'Original fact.',newText:'Corrected fact.'})).toBe(false);
+ expect(await call('done','complete_consolidation',{dispositions:[{timestamp:'a',path:'facts.md'},{timestamp:'b',reason:'noise'}]})).toBe(false);
+ await end();
+ expect(readReceipt(root,request).dispositions).toHaveLength(2);
+ expect(ctx.abort).not.toHaveBeenCalled();
+});
+it('exhausting the edit budget with schema rejections aborts with a precise reason',async()=>{
+ const {root,request,ctx,reject,end}=setup();
+ for(let i=0;i<3;i++){await reject(`bad-${i}`,'edit');expect(ctx.abort).not.toHaveBeenCalled();}
+ await reject('fourth','edit');
+ expect(ctx.abort).toHaveBeenCalledOnce();
+ await end();
+ expect(()=>readReceipt(root,request)).toThrow('rejected before execution (invalid arguments); correction budget exhausted');
+});

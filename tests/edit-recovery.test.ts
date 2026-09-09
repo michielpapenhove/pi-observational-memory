@@ -129,6 +129,18 @@ it('edits after accepted completion are still fatal, even when the text would no
  expect(worker.recoverableErrors.size).toBe(0);
 });
 
+it('pre-execute schema rejections share the edit budget and are never double-charged', async () => {
+ const { worker, edit } = setup();
+ expect(worker.noteRejectedCall('read', 'other')).toBe(false);
+ expect(worker.failure()).toBeUndefined();
+ expect(worker.noteRejectedCall('edit', 'reject-1')).toBe(true);
+ expect(worker.noteRejectedCall('edit', 'reject-1')).toBe(true);
+ expect(worker.noteRejectedCall('edit', 'reject-2')).toBe(true);
+ await expect(edit('mismatch', 'missing')).rejects.toThrow('3/3');
+ expect(worker.noteRejectedCall('edit', 'reject-4')).toBe(false);
+ expect(worker.failure()).toContain('correction budget exhausted');
+});
+
 it('recovery only pardons tracked edit/confirmation errors, never arbitrary tool or model failures', () => {
  const allowed = new Set(['repairable']);
  const stop = { role: 'assistant', stopReason: 'stop' };
