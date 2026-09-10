@@ -19,3 +19,13 @@ it('partial project model settings inherit unspecified global fields and the oth
  expect(config.models.consolidator).toEqual({provider:'another',id:'consolidator',thinking:'off'});
  expect(config.chunkTokens).toBe(3000);
 });
+it('accepts max thinking and falls back to the default on an unknown level',()=>{
+ const root=mkdtempSync(join(tmpdir(),'om-config-thinking-'));roots.push(root);
+ const global=join(root,'global');
+ mkdirSync(global,{recursive:true});
+ vi.mocked(getAgentDir).mockReturnValue(global);
+ writeFileSync(join(global,'settings.json'),JSON.stringify({'observational-memory':{models:{observer:{provider:'p',id:'flash',thinking:'max'},consolidator:{provider:'p',id:'flash',thinking:'very-high'}}}}));
+ const config=loadConfig(join(root,'project'),{});
+ expect(config.models.observer).toEqual({provider:'p',id:'flash',thinking:'max'});
+ expect(config.models.consolidator).toEqual({provider:'p',id:'flash',thinking:'medium'});
+});
