@@ -3,16 +3,10 @@ import { join } from "node:path";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
-/**
- * pi's thinking levels plus "max", which current pi accepts on the CLI and maps in its model
- * catalog but which the pinned pi-ai type does not declare yet.
- */
-export type ConfiguredThinkingLevel = ModelThinkingLevel | "max";
-
 export interface ConfiguredModel {
 	provider: string;
 	id: string;
-	thinking?: ConfiguredThinkingLevel;
+	thinking?: ModelThinkingLevel;
 }
 
 export interface Config {
@@ -78,7 +72,7 @@ export const DEFAULTS: Config = {
 	debugLog: false,
 };
 
-const THINKING_LEVEL_VALUES: readonly ConfiguredThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+const THINKING_LEVEL_VALUES: readonly ModelThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 const SETTINGS_KEY = "observational-memory";
 const PASSIVE_ENV = "PI_OM_PASSIVE";
@@ -87,7 +81,7 @@ function positiveIntegerOrUndefined(value: unknown): number | undefined {
 	return Number.isInteger(value) && typeof value === "number" && value > 0 ? value : undefined;
 }
 
-function isThinkingLevel(value: unknown): value is ConfiguredThinkingLevel {
+function isThinkingLevel(value: unknown): value is ModelThinkingLevel {
 	return typeof value === "string" && (THINKING_LEVEL_VALUES as readonly string[]).includes(value);
 }
 
