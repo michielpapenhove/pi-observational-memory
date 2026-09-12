@@ -44,7 +44,7 @@ Run `/reload` and `/om on` afterward. Updating this fork does not require discar
 3. One consolidator may run alongside the observer. It folds the oldest observations into flat topic files.
 4. Its final `complete_consolidation` call accounts for **every** supplied observation with a topic filename or explicit discard reason. Existing facts can reference an unchanged topic; needless rewrites are not required.
 5. A rejected consolidator confirmation lists missing, unknown and duplicate IDs. The worker may resubmit a full corrected array, with up to three correction opportunities. An edit rejected because `oldText` is missing or ambiguous also allows up to three correction opportunities across the run, with a separate budget. The rejection changes no bytes and instructs the worker to reread the file and copy an exact unique substring; matching stays strict, without fuzzy replacement. These precisely tracked errors do not invalidate a subsequently accepted confirmation. A fourth edit mismatch, any other edit/read/write failure, or an edit after accepted completion stops the worker immediately. The worker extension writes a success receipt only after a normal final model stop without unrecovered model/tool failures. The master checks the receipt identity, all dispositions, referenced topic metadata/body and content hashes before removing the batch from the buffer.
-6. Compaction uses only confirmed chunk boundaries. Without one, it cancels rather than replacing unobserved history with an empty summary. With observer backlog, it can retain a larger raw tail than requested.
+6. Compaction uses only confirmed chunk boundaries, and never places the cutoff at or before an existing compaction entry: pi keeps everything from `firstKeptEntryId` onward, so such a cutoff would fold an older summary back into the live context and make compaction grow the window instead of shrinking it. When the best qualifying boundary still leaves more than `maxTailTokens` verbatim (the observer is lagging behind the tip), the cutoff moves ahead of the observer to `tailTokens`; source entries skipped that way are not lost, because the observer reads the branch rather than the context, and their observations are folded into a later summary. When no cutoff qualifies at all — no confirmed chunk yet, or nothing left to keep — compaction cancels rather than replacing unobserved history with an empty summary.
 
 Receipts verify bookkeeping and file bytes, **not semantic completeness**. A model can still summarize poorly or wrongly classify a fact as noise. This is not a lossless database.
 
@@ -104,6 +104,7 @@ Namespace `observational-memory` in global or project Pi settings:
 | `consolidateAtPoolTokens` | 15000 |
 | `compactAtContextTokens` | 150000 |
 | `tailTokens` | 20000 |
+| `maxTailTokens` | 40000 |
 | `journeyTargetTokens` | 1000 |
 | `workerTimeoutMs` | 900000 |
 | `maxWorkerPromptBytes` | 262144 |

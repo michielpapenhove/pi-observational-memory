@@ -296,10 +296,26 @@ pi --no-extensions --no-skills --no-prompt-templates --no-context-files \
   when the turn had pending tool work. A `turn_end` that is also the run's terminal turn
   (`toolResults` empty) is left to stop, exactly as if no compaction happened. The mid-run
   decision is captured from the `turn_end` event *before* compaction aborts/reloads.
+  It also fires when the hook **cancelled** the compaction: `ctx.compact()` already aborted the
+  loop, so without the resume a refusal (observer behind, nothing to fold) would silently stop a
+  mid-run turn. A genuine compaction *failure* is reported instead and does not resume.
 - **Hook** (`session_before_compact`), deterministic + model-free:
   1. `preparation.firstKeptEntryId` gives pi's proposed kept tail. **Snap** it to the nearest
      **observation chunk boundary** (a covered `coversUpToId` source-entry id) such that the
      verbatim tail ≈ `tailTokens`. The actual tail may be slightly larger/smaller to align.
+     Two rules keep the cutoff from growing the window instead of shrinking it:
+     - A boundary is only eligible while its `firstKeptEntryId` lands **after** the last
+       compaction entry. pi keeps everything from `firstKeptEntryId` onward and re-emits a kept
+       compaction entry as a summary message, so a cutoff behind it folds that summary back into
+       the live context (observed in production: 20 stacked summaries, 509k of 642k tokens).
+     - When the best eligible boundary still leaves more than `maxTailTokens` verbatim, the
+       cutoff moves **ahead of the observer** to the earliest valid cut point with tail ≤
+       `tailTokens` (`kind: "forward"`). Skipped source entries stay in the branch, so the
+       observer still observes them and a later summary folds them in. Without an eligible
+       boundary *and* without a forward cut, compaction cancels (`kind: "none"`) rather than
+       performed without shrinking anything. A forward cut is also refused while the observer is
+       stalled (`observerBlocked`, or retries exhausted): the justification for cutting ahead is
+       that the observer reaches the skipped region later, and that no longer holds.
   2. `buildCompactionProjection(branch, snappedFirstKeptId)` → active observations whose
      `coversUpToId` ≤ cutoff. Observations whose source lies in the kept tail are **excluded**
      (already verbatim) — this falls out of the projection boundary automatically.
@@ -442,6 +458,7 @@ Namespace `observational-memory` under `~/.pi/agent/settings.json` and project
   "consolidateAtPoolTokens": 20000,     // Phase B (200% of target)
   "compactAtContextTokens": 100000,     // tune per model
   "tailTokens": 20000,                  // verbatim tail; snaps to chunk boundary
+  "maxTailTokens": 40000,               // ceiling; beyond it the cutoff moves ahead of the observer
   "journeyTargetTokens": 1000,          // Phase B — pushed JOURNEY.md size; compress old tail past this
   "observerConcurrency": 4,
   "models": {
@@ -465,7 +482,7 @@ Namespace `observational-memory` under `~/.pi/agent/settings.json` and project
 | R2 just-promoted blind spot | INDEX summary quality is load-bearing; conservative routing + good front-matter. |
 | R3 INDEX staleness | Master reads live FS; orchestrator re-renders INDEX.md post-consolidation. |
 | R4 observer/consolidator concurrency | One consolidator at a time; tombstone the handed batch ∩ still-active (no report-back) — a during-run observation isn't in the batch, so never tombstoned. Enforced in `consolidator-trigger.ts`. |
-| R5 compaction stalls on slow worker | Wait only for in-flight **observers** (not consolidators). **Fast path:** skip the wait entirely when no in-flight observer can affect the block (`canSkipObserverWait`) — each in-flight observer's chunk ends after the cutoff (excluded from the projection) **and** the snapped tail is already ≤ `tailTokens` (snap is provably stable). In the steady state observers cover only tail chunks, so compaction is instant; it only blocks for a genuinely pre-cutoff slow observer (out-of-order completion). |
+| R5 compaction stalls on slow worker | Wait only for in-flight **observers** (not consolidators). **Fast path:** skip the wait entirely when no in-flight observer can affect the block (`canSkipObserverWait`) — each in-flight observer's chunk ends after the cutoff (excluded from the projection) **and** the snapped tail is already ≤ `tailTokens` (snap is provably stable). The fast path applies to a **boundary** snap only: a forward cut must wait, since a just-committed boundary would replace it with a fully observed cutoff. In the steady state observers cover only tail chunks, so compaction is instant; it only blocks for a genuinely pre-cutoff slow observer (out-of-order completion). |
 | R6 `--no-builtin-tools` + consolidator | Consolidator extension registers its own `.memory/`-scoped read/write/edit. |
 | R7 timestamp-id reliability | Resolved by L5: orchestrator assigns ids; observer emits minute-resolution only. |
 
@@ -473,7 +490,11 @@ Namespace `observational-memory` under `~/.pi/agent/settings.json` and project
 
 ## Open tuning items (defaults set; revisit during use)
 
-- `compactAtContextTokens`, `tailTokens` — tune per target model (defaults above).
+- `compactAtContextTokens`, `tailTokens`, `maxTailTokens` — tune per target model (defaults above).
+- `maxTailTokens` — how far the observer may lag before compaction cuts ahead of it. Raise it to
+  keep more verbatim history at the cost of a larger context right after compaction (the tail plus
+  the summary has to stay below `compactAtContextTokens`, otherwise compaction fires again on the
+  next turn).
 - `chunkOverlapTokens` — default 0; raise if boundary-spanning events are lost.
 - Consolidator topic-routing aggressiveness — start conservative (fewer, larger topics).
 - Observer/consolidator model split — currently strong everywhere (L6); try cheap/fast

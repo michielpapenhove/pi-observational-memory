@@ -86,32 +86,42 @@ export function registerCompactionTrigger(pi: ExtensionAPI, runtime: Runtime): v
 		runtime.compactInFlight = true;
 		if (hasUI) ui?.notify("om: context threshold reached — compacting (waiting for in-flight observers)…", "info");
 
+		/**
+		 * Resume the run after compaction settles — also when it was *cancelled*.
+		 *
+		 * `ctx.compact()` disconnects + aborts the agent loop before the hook runs, so a refusal
+		 * (observer behind or stopped, nothing to fold) would otherwise stop a mid-run turn for a
+		 * no-op. Only a mid-run compaction resumes; a terminal turn is left to stop.
+		 */
+		const resumeRun = () => {
+			if (!shouldResume || !runtime.enabled || runtime.config.passive) return;
+			try {
+				// sendMessage lives on the ExtensionAPI (`pi`), not on the event-handler ctx
+				// (ExtensionContext). Triggers a new turn from a hidden custom message.
+				pi.sendMessage({ customType: OM_RESUME, content: RESUME_PROMPT, display: false }, { triggerTurn: true });
+			} catch (error) {
+				const msg = error instanceof Error ? error.message : String(error);
+				runtime.lastWorkerError = `resume failed: ${msg}`;
+				if (hasUI) ui?.notify(`om: resume failed — ${msg}`, "error");
+			}
+		};
+
 		// Fire-and-forget. The before-compact hook waits for observers and renders the block.
 		ctx.compact({
 			onComplete: () => {
 				if (!runtime.isCurrent(generation)) return;
 				runtime.compactInFlight = false;
 				if (hasUI) ui?.notify("om: compaction complete", "info");
-				// Resume only a mid-run compaction, and only if still enabled (the gate may have
-				// flipped, or the session may be tearing down, while compaction ran).
-				if (!shouldResume || !runtime.enabled || runtime.config.passive) return;
-				try {
-					// sendMessage lives on the ExtensionAPI (`pi`), not on the event-handler ctx
-					// (ExtensionContext). Triggers a new turn from a hidden custom message.
-					pi.sendMessage(
-						{ customType: OM_RESUME, content: RESUME_PROMPT, display: false },
-						{ triggerTurn: true },
-					);
-				} catch (error) {
-					const msg = error instanceof Error ? error.message : String(error);
-					runtime.lastWorkerError = `resume failed: ${msg}`;
-					if (hasUI) ui?.notify(`om: resume failed — ${msg}`, "error");
-				}
+				resumeRun();
 			},
 			onError: (error: { message: string }) => {
 				if (!runtime.isCurrent(generation)) return;
 				runtime.compactInFlight = false;
-				if (error.message === "Compaction cancelled") return;
+				if (error.message === "Compaction cancelled") {
+					// The hook refused: the context is untouched, so continue exactly where we were.
+					resumeRun();
+					return;
+				}
 				if (hasUI) ui?.notify(`om: ${error.message}`, "error");
 			},
 		});

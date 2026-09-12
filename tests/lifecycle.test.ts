@@ -46,3 +46,29 @@ it('late compaction callbacks cannot resume or clear the newer session guard',()
  callbacks.onComplete(); callbacks.onError({message:'late failure'});
  expect(sendMessage).not.toHaveBeenCalled();expect(runtime.compactInFlight).toBe(true);
 });
+it('a cancelled compaction resumes a mid-run turn instead of orphaning it',()=>{
+ const runtime=new Runtime();runtime.enabled=true;
+ let handler:any, callbacks:any;
+ const sendMessage=vi.fn();
+ registerCompactionTrigger({on:(_n:any,h:any)=>handler=h,sendMessage} as any,runtime);
+ handler({message:{stopReason:'toolUse'}},{hasUI:false,getContextUsage:()=>({tokens:999999}),compact:(c:any)=>callbacks=c});
+ callbacks.onError({message:'Compaction cancelled'});
+ expect(sendMessage).toHaveBeenCalledTimes(1);
+ expect(sendMessage.mock.calls[0][0].customType).toBe('om.resume');
+ expect(sendMessage.mock.calls[0][1]).toEqual({triggerTurn:true});
+ expect(runtime.compactInFlight).toBe(false);
+});
+it('a cancelled compaction on a terminal turn stays stopped, and a failure never resumes',()=>{
+ const runtime=new Runtime();runtime.enabled=true;
+ let handler:any, callbacks:any;
+ const sendMessage=vi.fn();
+ registerCompactionTrigger({on:(_n:any,h:any)=>handler=h,sendMessage} as any,runtime);
+ // Terminal turn: no pending tool work → compaction must not restart the run.
+ handler({message:{stopReason:'stop'},toolResults:[]},{hasUI:false,getContextUsage:()=>({tokens:999999}),compact:(c:any)=>callbacks=c});
+ callbacks.onError({message:'Compaction cancelled'});
+ expect(sendMessage).not.toHaveBeenCalled();
+ // Mid-run turn, but the compaction failed for another reason: the error is reported, not papered over.
+ handler({message:{stopReason:'toolUse'}},{hasUI:false,getContextUsage:()=>({tokens:999999}),compact:(c:any)=>callbacks=c});
+ callbacks.onError({message:'Summarization failed: boom'});
+ expect(sendMessage).not.toHaveBeenCalled();
+});

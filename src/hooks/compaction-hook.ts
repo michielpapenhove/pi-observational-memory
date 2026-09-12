@@ -2,9 +2,11 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { renderMemoryMap } from "../memory/index-render.js";
 import { listTopics, readJourney } from "../memory/paths.js";
 import type { Runtime } from "../runtime.js";
+import { estimateEntryTokens } from "../tokens.js";
 import {
 	buildCompactionProjection,
 	entryIndexById,
+	findLastCompactionIndex,
 	isObservationsRecordedEntry,
 	isSourceEntry,
 	isValidCutPoint,
@@ -14,8 +16,7 @@ import {
 } from "../ledger/index.js";
 
 /** Distinct, branch-resolved coversUpToId indices of committed observation chunks, ascending. */
-function chunkBoundaryIndices(branch: Entry[]): number[] {
-	const indexes = entryIndexById(branch);
+function chunkBoundaryIndices(branch: Entry[], indexes: Map<string, number>): number[] {
 	const set = new Set<number>();
 	for (const entry of branch) {
 		if (!isObservationsRecordedEntry(entry)) continue;
@@ -34,19 +35,85 @@ function firstKeptAfterBoundary(branch: Entry[], boundaryIndex: number): Entry |
 	return undefined;
 }
 
+export type CutoffKind = "boundary" | "forward" | "none";
+
+export type CutoffSnap = {
+	/** Entry the verbatim tail starts at. */
+	firstKeptId: string;
+	/** Raw source tokens retained verbatim after the cutoff; undefined when nothing qualified. */
+	tail: number | undefined;
+	/**
+	 * "boundary": the cutoff sits on a confirmed observation chunk boundary (the normal case).
+	 * "forward": the cutoff sits ahead of the observer's watermark, keeping the tail bounded.
+	 * "none": no usable cutoff (see `reason`); the caller must cancel the compaction.
+	 */
+	kind: CutoffKind;
+	/** Why no cutoff qualified. Only set when `kind` is "none". */
+	reason?: "no-observation-boundary" | "behind-last-compaction";
+};
+
+/** Estimated raw source tokens from `startIndex` (inclusive) to the tip. */
+function rawTokensFromIndex(branch: Entry[], startIndex: number): number {
+	let total = 0;
+	for (let i = Math.max(0, startIndex); i < branch.length; i++) {
+		if (isSourceEntry(branch[i])) total += estimateEntryTokens(branch[i]);
+	}
+	return total;
+}
+
+/**
+ * Earliest valid cut point at or after `startIndex` whose verbatim tail is at most `tailTokens`.
+ *
+ * Used when the observer has committed no chunk boundary close enough to the tip: pi keeps
+ * everything from `firstKeptEntryId` onward, so a boundary far behind the tip would retain a
+ * huge verbatim tail (and, when it sits behind an existing compaction entry, fold that summary
+ * back into the live context). Cutting ahead of the observer keeps the tail at its designed
+ * size. Source entries skipped this way are not lost: the observer reads the branch, not the
+ * context, so its observations still arrive and are folded into a later summary.
+ */
+function forwardCut(branch: Entry[], startIndex: number, tailTokens: number): { firstKeptId: string; tail: number } | undefined {
+	let tail = rawTokensFromIndex(branch, startIndex);
+	for (let i = Math.max(0, startIndex); i < branch.length; i++) {
+		const entry = branch[i];
+		if (!isSourceEntry(entry)) continue;
+		if (isValidCutPoint(entry) && tail <= tailTokens) return { firstKeptId: entry.id, tail };
+		tail -= estimateEntryTokens(entry);
+	}
+	return undefined;
+}
+
 /**
  * Snap pi's proposed `firstKeptEntryId` to an observation chunk boundary so the verbatim tail
  * starts exactly where a chunk ends — no chunk straddles the cutoff, so nothing is both
  * rendered into the summary and kept verbatim (and nothing is lost). Among boundaries whose
- * next entry is a valid cut point, pick the one whose resulting tail is closest to
- * `tailTokens`. Falls back to pi's proposal when no boundary qualifies (`tail` undefined).
+ * next entry is a valid cut point and that land *after* the last compaction, pick the one whose
+ * resulting tail is closest to `tailTokens`.
+ *
+ * Two rules keep compaction from growing the window instead of shrinking it:
+ *  - A cutoff at or before the last compaction entry would fold that summary back into the live
+ *    context (pi keeps everything from `firstKeptEntryId` onward), so those boundaries are
+ *    never eligible.
+ *  - When the best eligible boundary still leaves more than `maxTailTokens` verbatim — i.e. the
+ *    observer is lagging behind the tip — the cutoff moves ahead of the observer to
+ *    `tailTokens` instead (see {@link forwardCut}). When even that is impossible the compaction
+ *    is refused rather than performed without shrinking anything.
+ *
+ * Falls back to pi's proposal with `kind: "none"` when no cutoff qualifies.
  */
 export function snapCutoff(
 	branch: Entry[],
 	proposedFirstKeptId: string,
 	tailTokens: number,
-): { firstKeptId: string; tail: number | undefined } {
-	const boundaries = chunkBoundaryIndices(branch);
+	maxTailTokens: number = tailTokens * 2,
+): CutoffSnap {
+	const indexes = entryIndexById(branch);
+	const boundaries = chunkBoundaryIndices(branch, indexes);
+	// Without a single committed chunk there is nothing to render and nothing to summarize.
+	if (boundaries.length === 0) {
+		return { firstKeptId: proposedFirstKeptId, tail: undefined, kind: "none", reason: "no-observation-boundary" };
+	}
+
+	const lastCompactionIndex = findLastCompactionIndex(branch);
 	let bestId: string | undefined;
 	let bestTail: number | undefined;
 	let bestDelta = Number.POSITIVE_INFINITY;
@@ -54,6 +121,8 @@ export function snapCutoff(
 	for (const boundaryIndex of boundaries) {
 		const firstKept = firstKeptAfterBoundary(branch, boundaryIndex);
 		if (!firstKept) continue;
+		const firstKeptIndex = indexes.get(firstKept.id);
+		if (firstKeptIndex === undefined || firstKeptIndex <= lastCompactionIndex) continue;
 		const tail = rawTokensAfterIndex(branch, boundaryIndex);
 		const delta = Math.abs(tail - tailTokens);
 		if (delta < bestDelta) {
@@ -63,15 +132,63 @@ export function snapCutoff(
 		}
 	}
 
-	return bestId ? { firstKeptId: bestId, tail: bestTail } : { firstKeptId: proposedFirstKeptId, tail: undefined };
+	if (bestId !== undefined && bestTail !== undefined && bestTail <= maxTailTokens) {
+		return { firstKeptId: bestId, tail: bestTail, kind: "boundary" };
+	}
+
+	const forward = forwardCut(branch, lastCompactionIndex + 1, tailTokens);
+	if (forward) return { firstKeptId: forward.firstKeptId, tail: forward.tail, kind: "forward" };
+
+	return { firstKeptId: proposedFirstKeptId, tail: undefined, kind: "none", reason: "behind-last-compaction" };
 }
 
-export function snapFirstKeptEntryId(branch: Entry[], proposedFirstKeptId: string, tailTokens: number): string {
-	return snapCutoff(branch, proposedFirstKeptId, tailTokens).firstKeptId;
+export function snapFirstKeptEntryId(
+	branch: Entry[],
+	proposedFirstKeptId: string,
+	tailTokens: number,
+	maxTailTokens?: number,
+): string {
+	return snapCutoff(branch, proposedFirstKeptId, tailTokens, maxTailTokens).firstKeptId;
+}
+
+/**
+ * A forward cut is only justified while the observer can still reach the skipped region later:
+ * its observations are what folds that history into a summary eventually. Once the observer is
+ * permanently stalled (an oversized chunk blocks the watermark, or retries are exhausted), the
+ * skip would silently drop never-observed history from the live context, so refuse instead.
+ */
+export function observerStalled(
+	runtime: Pick<Runtime, "observerBlocked" | "observerFailures">,
+	maxWorkerAttempts: number,
+): boolean {
+	return runtime.observerBlocked !== undefined || runtime.observerFailures >= maxWorkerAttempts;
+}
+
+/** Why a compaction was refused. */
+export type CancelReason = "no-observation-boundary" | "behind-last-compaction" | "observer-stalled";
+
+export type CompactionDecision = { action: "compact" } | { action: "cancel"; reason: CancelReason };
+
+const CANCEL_NOTICES: Record<CancelReason, string> = {
+	"no-observation-boundary": "om: no confirmed observer boundary; compaction cancelled to retain raw history",
+	"behind-last-compaction": "om: observer is behind the last compaction; compaction deferred (raw history retained)",
+	"observer-stalled":
+		"om: observer is stopped — refusing to compact ahead of it so unobserved history stays intact (see /om:status)",
+};
+
+/** Turn a snap into the hook's decision, including the refusals that outrank a forward cut. */
+export function decideCompaction(snap: CutoffSnap, observerIsStalled: boolean): CompactionDecision {
+	if (snap.kind === "none") return { action: "cancel", reason: snap.reason ?? "no-observation-boundary" };
+	if (snap.kind === "forward" && observerIsStalled) return { action: "cancel", reason: "observer-stalled" };
+	return { action: "compact" };
 }
 
 /**
  * Fast-path test: can compaction skip waiting for in-flight observers entirely?
+ *
+ * Only meaningful for a **boundary** snap (`kind: "boundary"`). A forward cut must always wait:
+ * committing a tail-region boundary can replace it with a fully observed cutoff, which is strictly
+ * better than cutting ahead of the observer.
  *
  * The wait exists so just-committed observations are folded before rendering. But an observer
  * only affects the rendered block if its chunk's `coversUpToId` lands at-or-before the cutoff
@@ -125,31 +242,44 @@ export function registerCompactionHook(pi: ExtensionAPI, runtime: Runtime): void
 		try {
 			runtime.ensureConfig(ctx.cwd);
 			const tailTokens = runtime.config.tailTokens;
+			const maxTailTokens = runtime.config.maxTailTokens;
 			const { firstKeptEntryId, tokensBefore } = event.preparation;
 
 			// Compute the snap from the CURRENT (pre-wait) branch. The snap only reads committed
 			// chunk boundaries (fixed at hook entry), so this is safe to do before any wait and lets
 			// us decide whether the wait is needed at all.
 			let branch = (ctx.sessionManager?.getBranch?.() as Entry[] | undefined) ?? (event.branchEntries as Entry[]);
-			let snap = snapCutoff(branch, firstKeptEntryId, tailTokens);
+			let snap = snapCutoff(branch, firstKeptEntryId, tailTokens, maxTailTokens);
 
 			// R5 fast path: skip the wait when no in-flight observer can affect this compaction
 			// (its chunk lands in the verbatim tail and the snap is stable). Otherwise wait for
 			// observers to settle, then re-read the branch and recompute the snap so just-committed
 			// `om.observations.recorded` entries are folded (pi's `event.branchEntries` is stale).
-			const skip = canSkipObserverWait(branch, snap.firstKeptId, snap.tail, tailTokens, runtime.observersInFlight.values());
+			// Only a boundary snap is provably stable under skipped observers; a forward cut should
+			// wait, because a just-committed boundary can replace it with a fully observed cutoff.
+			const skip =
+				snap.kind === "boundary" &&
+				canSkipObserverWait(branch, snap.firstKeptId, snap.tail, tailTokens, runtime.observersInFlight.values());
 			runtime.lastCompactionObserverWait = skip ? "skipped" : "waited";
 			if (!skip) {
-				if (hasUI) ctx.ui.notify("om: waiting for in-flight observers before folding…", "info");
+				if (hasUI && runtime.observersInFlight.size > 0)
+					ctx.ui.notify("om: waiting for in-flight observers before folding…", "info");
 				await runtime.whenObserversIdle();
 				branch = (ctx.sessionManager?.getBranch?.() as Entry[] | undefined) ?? (event.branchEntries as Entry[]);
-				snap = snapCutoff(branch, firstKeptEntryId, tailTokens);
+				snap = snapCutoff(branch, firstKeptEntryId, tailTokens, maxTailTokens);
 			}
 
 			if (!runtime.isCurrent(generation) || event.signal?.aborted) return { cancel: true };
-			if (snap.tail === undefined) {
-				if (hasUI) ctx.ui.notify("om: no confirmed observer boundary; compaction cancelled to retain raw history", "warning");
+			const decision = decideCompaction(snap, observerStalled(runtime, runtime.config.maxWorkerAttempts));
+			if (decision.action === "cancel") {
+				if (hasUI) ctx.ui.notify(CANCEL_NOTICES[decision.reason], "warning");
 				return { cancel: true };
+			}
+			if (snap.kind === "forward" && hasUI) {
+				ctx.ui.notify(
+					`om: observer is behind — cutting ahead of it so the verbatim tail stays near ${Math.round(tailTokens / 1000)}k tokens`,
+					"info",
+				);
 			}
 			const snapped = snap.firstKeptId;
 			const projection = buildCompactionProjection(branch, snapped);

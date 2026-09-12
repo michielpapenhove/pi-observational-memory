@@ -23,6 +23,12 @@ export interface Config {
 	/** Verbatim raw tail kept after the cutoff; snaps to a chunk boundary. */
 	tailTokens: number;
 	/**
+	 * Hard ceiling for the verbatim tail. A chunk boundary is only accepted while its tail
+	 * stays within this; beyond it the cutoff moves ahead of the observer to `tailTokens`
+	 * instead of retaining a huge tail (or compacting without shrinking anything).
+	 */
+	maxTailTokens: number;
+	/**
 	 * Target size of `.memory/JOURNEY.md`, the running descriptive project history the
 	 * consolidator appends to and pushes into every compaction block. When the file grows past
 	 * this, the consolidator compresses its oldest entries (recent history stays detailed).
@@ -57,6 +63,7 @@ export const DEFAULTS: Config = {
 	consolidateAtPoolTokens: 15_000,
 	compactAtContextTokens: 150_000,
 	tailTokens: 20_000,
+	maxTailTokens: 40_000,
 	journeyTargetTokens: 1_000,
 	observerConcurrency: 1,
 	workerTimeoutMs: 15 * 60_000,
@@ -112,6 +119,7 @@ function normalizeSettingsConfig(value: Record<string, unknown>, base: Config): 
 		"consolidateAtPoolTokens",
 		"compactAtContextTokens",
 		"tailTokens",
+		"maxTailTokens",
 		"journeyTargetTokens",
 		"observerConcurrency",
 		"workerTimeoutMs",
@@ -165,7 +173,7 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env): C
 	const globalBase: Config = { ...DEFAULTS, ...globalConfig, models: { ...DEFAULTS.models, ...globalConfig.models } };
 	const projectConfig = readNamespacedConfig(projectPath, globalBase);
 	const envConfig = readEnvConfig(env);
-	return {
+	const merged: Config = {
 		...DEFAULTS,
 		...globalConfig,
 		...projectConfig,
@@ -176,4 +184,7 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env): C
 			...projectConfig.models,
 		},
 	};
+	// The ceiling can never sit below the target: a band under `tailTokens` would reject every
+	// boundary snap and turn every compaction into a forward cut.
+	return { ...merged, maxTailTokens: Math.max(merged.maxTailTokens, merged.tailTokens) };
 }
