@@ -42,7 +42,7 @@ MASTER SESSION
      • commits observations  → pi.appendEntry("om.observations.recorded", …)   [ledger]
      • tombstones the batch  → pi.appendEntry("om.observations.dropped", …)    [ledger, Phase B]
      • deterministic compact → pi.on("session_before_compact") → {summary, firstKeptEntryId, …}
-     • compaction trigger    → pi.on("agent_end") → ctx.compact() when over threshold & idle
+     • compaction trigger    → pi.on("turn_end") → compaction boundary draft when over threshold
      • TUI                    → ctx.ui.setStatus / setWidget / notify
      • commands               → /om:status, /om:compact (debug surfaces)
 
@@ -88,7 +88,7 @@ observational-memory/
     hooks/
       observer-trigger.ts # raw-token clock → spawn parallel observers, commit results
       consolidator-trigger.ts  # [Phase B] pool-token clock → spawn one consolidator, tombstone promoted
-      compaction-trigger.ts    # agent_end → ctx.compact() when over compactAtContextTokens & idle
+      compaction-trigger.ts    # turn_end boundary → commit a compaction draft over compactAtContextTokens
       compaction-hook.ts       # session_before_compact → render map+buffer, cutoff on chunk boundary
     commands/
       status.ts           # /om:status
@@ -282,23 +282,24 @@ pi --no-extensions --no-skills --no-prompt-templates --no-context-files \
   no markdown; prefer inline conversation timestamps." Drop relevance/sourceEntryIds language.
 
 ### A6. Compaction (`hooks/compaction-trigger.ts`, `hooks/compaction-hook.ts`)
-- **Trigger** (`turn_end`): if context pressure `>= compactAtContextTokens` and not already
-  compacting → `ctx.compact()` (fire-and-forget). `ctx.compact()` synchronously disconnects +
-  aborts the agent loop up front, so firing it from `turn_end` is race-free; the
-  `session_before_compact` hook waits for in-flight observers so the block reflects settled
-  state. We fire on `turn_end` (not `agent_end`) so compaction pauses the chat *between* turns.
-- **Auto-resume after a mid-run compaction** (`resumeAfterMidRunCompaction`, default true):
-  a manual/threshold compaction always leaves the session idle (only pi's *internal overflow*
-  path auto-retries). To make a mid-run compaction transparent, in `onComplete` we resume the
-  agent ourselves via `ctx.sendMessage({ customType: "om.resume", display:false }, { triggerTurn:true })`
-  — a hidden custom message pi surfaces to the model as a user turn (no agent-*invisible* resume
-  exists through the public API; `convertToLlm` rewrites custom→user). The resume fires **only**
-  when the turn had pending tool work. A `turn_end` that is also the run's terminal turn
-  (`toolResults` empty) is left to stop, exactly as if no compaction happened. The mid-run
-  decision is captured from the `turn_end` event *before* compaction aborts/reloads.
-  It also fires when the hook **cancelled** the compaction: `ctx.compact()` already aborted the
-  loop, so without the resume a refusal (observer behind, nothing to fold) would silently stop a
-  mid-run turn. A genuine compaction *failure* is reported instead and does not resume.
+- **Trigger** (`turn_end`): if the turn completed, is not a retryable provider failure, and context
+  pressure is `>= compactAtContextTokens` → build a plan and return it as a **compaction boundary
+  draft** (`{ entries: [...event.entries, { type: "compaction", … }] }`). pi persists the draft in
+  order; the agent loop keeps its own decision, so the trigger never sets `continue`. We fire on
+  `turn_end` (not `agent_end`) so compaction lands *between* turns rather than only once the whole
+  run settles.
+- **No resume workaround.** Before 0.87 this used `ctx.compact()`, which disconnected and aborted
+  the agent loop up front and then needed a hidden `ctx.sendMessage(..., { triggerTurn: true })`
+  resume message whenever the hook refused — a synthetic user turn in the model context, and a
+  window in which a refused compaction could strand a mid-run turn. The boundary draft removes
+  both: pending tool work still continues, a terminal turn still stops, and a refusal is simply
+  "no compaction this turn". Nothing is aborted, so there is nothing to resume and nothing to
+  fence beyond dropping the draft when the session changed mid-wait.
+- **Shared plan** (`planCompaction`, compaction-hook.ts): the cutoff snapshot, the R5 observer
+  wait and the rendered block live in one function used by *both* the boundary trigger and the
+  `session_before_compact` hook, so their rules cannot drift apart. The hook keeps serving pi's
+  own paths — `/compact`, pi's between-turn threshold, and overflow recovery — where a
+  `{ cancel: true }` decision is a genuine refusal rather than a missed opportunity.
 - **Hook** (`session_before_compact`), deterministic + model-free:
   1. `preparation.firstKeptEntryId` gives pi's proposed kept tail. **Snap** it to the nearest
      **observation chunk boundary** (a covered `coversUpToId` source-entry id) such that the
@@ -482,7 +483,7 @@ Namespace `observational-memory` under `~/.pi/agent/settings.json` and project
 | R2 just-promoted blind spot | INDEX summary quality is load-bearing; conservative routing + good front-matter. |
 | R3 INDEX staleness | Master reads live FS; orchestrator re-renders INDEX.md post-consolidation. |
 | R4 observer/consolidator concurrency | One consolidator at a time; tombstone the handed batch ∩ still-active (no report-back) — a during-run observation isn't in the batch, so never tombstoned. Enforced in `consolidator-trigger.ts`. |
-| R5 compaction stalls on slow worker | Wait only for in-flight **observers** (not consolidators). **Fast path:** skip the wait entirely when no in-flight observer can affect the block (`canSkipObserverWait`) — each in-flight observer's chunk ends after the cutoff (excluded from the projection) **and** the snapped tail is already ≤ `tailTokens` (snap is provably stable). The fast path applies to a **boundary** snap only: a forward cut must wait, since a just-committed boundary would replace it with a fully observed cutoff. In the steady state observers cover only tail chunks, so compaction is instant; it only blocks for a genuinely pre-cutoff slow observer (out-of-order completion). |
+| R5 compaction stalls on slow worker | Wait only for in-flight **observers** (not consolidators). **Fast path:** skip the wait entirely when no in-flight observer can affect the block (`canSkipObserverWait`) — each in-flight observer's chunk ends after the cutoff (excluded from the projection) **and** the snapped tail is already ≤ `tailTokens` (snap is provably stable). The fast path applies to a **boundary** snap only: a forward cut must wait, since a just-committed boundary would replace it with a fully observed cutoff. Both live in `planCompaction`, so the boundary trigger and the `session_before_compact` hook share one implementation. In the steady state observers cover only tail chunks, so compaction is instant; it only blocks for a genuinely pre-cutoff slow observer (out-of-order completion). A boundary-trigger wait is bounded by the turn itself: nothing is aborted, so a slow wait delays the next turn instead of stranding the run. |
 | R6 `--no-builtin-tools` + consolidator | Consolidator extension registers its own `.memory/`-scoped read/write/edit. |
 | R7 timestamp-id reliability | Resolved by L5: orchestrator assigns ids; observer emits minute-resolution only. |
 

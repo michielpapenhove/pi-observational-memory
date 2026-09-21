@@ -53,7 +53,11 @@ export class Runtime {
 
 	isCurrent(generation: number): boolean { return this.enabled && this.generation === generation; }
 
-	/** Guards so compaction trigger + hook never re-enter. */
+	/**
+	 * `/om:compact` in-progress guard. The threshold trigger no longer needs it: a boundary draft is
+	 * built and committed within the turn, so there is no window to re-enter. The hook keeps its own
+	 * `compactHookInFlight` guard against duplicate pi compactions.
+	 */
 	compactInFlight = false;
 	compactHookInFlight = false;
 

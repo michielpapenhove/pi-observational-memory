@@ -110,7 +110,6 @@ Namespace `observational-memory` in global or project Pi settings:
 | `maxWorkerPromptBytes` | 262144 |
 | `maxWorkerAttempts` | 3 |
 | `retryDelayMs` | 5000 |
-| `resumeAfterMidRunCompaction` | true |
 | `passive` | false |
 | `debugLog` | false |
 

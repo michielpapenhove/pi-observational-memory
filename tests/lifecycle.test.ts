@@ -6,6 +6,7 @@ import { spawnWorker } from '../src/spawn/launch.js';
 import { StatusController } from '../src/ui/status-controller.js';
 import { Runtime } from '../src/runtime.js';
 import { registerCompactionTrigger } from '../src/hooks/compaction-trigger.js';
+import { observation, observationsRecordedEntry, rawMessage } from './fixtures/session.js';
 const dirs:string[]=[];
 function temp(){const d=mkdtempSync(join(tmpdir(),'om-lifecycle-'));dirs.push(d);return d;}
 afterEach(()=>{vi.useRealTimers();dirs.splice(0).forEach(d=>rmSync(d,{recursive:true,force:true}));});
@@ -36,39 +37,127 @@ it('elapsed time and actual tool activity are visible, then detach stops updates
  status.detach(); const count=widgets.length; vi.advanceTimersByTime(10000);
  expect(widgets).toHaveLength(count);
 });
-it('late compaction callbacks cannot resume or clear the newer session guard',()=>{
- const runtime=new Runtime();runtime.enabled=true;
- let handler:any, callbacks:any;
- const sendMessage=vi.fn();
- registerCompactionTrigger({on:(_n:any,h:any)=>handler=h,sendMessage} as any,runtime);
- handler({message:{stopReason:'toolUse'}},{hasUI:false,getContextUsage:()=>({tokens:999999}),compact:(c:any)=>callbacks=c});
- runtime.abortAllWorkers();runtime.compactInFlight=true;
- callbacks.onComplete(); callbacks.onError({message:'late failure'});
- expect(sendMessage).not.toHaveBeenCalled();expect(runtime.compactInFlight).toBe(true);
+// ── Compaction on the `turn_end` boundary ──────────────────────────────────────────────────────
+// 40 chars ⇒ 10 estimated tokens per raw message.
+const body = 'x'.repeat(40);
+
+/**
+ * A branch with two committed observation chunks and a 20-token verbatim tail, so the 20-token
+ * target snaps onto `raw-4`'s chunk boundary and keeps `raw-5`+`raw-6` verbatim.
+ */
+function compactionSetup(options: { observed?: boolean; tailTokens?: number } = {}) {
+	const runtime = new Runtime();
+	runtime.enabled = true;
+	runtime.configLoaded = true; // never read the developer's real settings.json
+	runtime.memoryRoot = mkdtempSync(join(tmpdir(), 'om-compaction-'));
+	dirs.push(runtime.memoryRoot);
+	runtime.config = { ...runtime.config, tailTokens: options.tailTokens ?? 20, maxTailTokens: 40 };
+	const branch: any[] =
+		options.observed === false
+			? [rawMessage('raw-1', body), rawMessage('raw-2', body)]
+			: [
+					rawMessage('raw-1', body),
+					rawMessage('raw-2', body),
+					observationsRecordedEntry('om-1', {
+						observations: [observation('2026-05-02T10:00:01', { content: 'first' })],
+						coversUpToId: 'raw-2',
+					}),
+					rawMessage('raw-3', body),
+					rawMessage('raw-4', body),
+					observationsRecordedEntry('om-2', {
+						observations: [observation('2026-05-02T10:05:00', { content: 'second' })],
+						coversUpToId: 'raw-4',
+					}),
+					rawMessage('raw-5', body),
+					rawMessage('raw-6', body),
+				];
+	let handler: any;
+	const pi: any = { on: (_name: string, fn: any) => { handler = fn; }, sendMessage: vi.fn() };
+	const ctx: any = {
+		hasUI: true,
+		ui: { notify: vi.fn() },
+		cwd: runtime.memoryRoot,
+		signal: undefined,
+		getContextUsage: () => ({ tokens: 999_999 }),
+		sessionManager: { getBranch: () => branch },
+	};
+	registerCompactionTrigger(pi, runtime);
+	const run = (event: Record<string, unknown> = {}) =>
+		handler(
+			{ outcome: 'completed', entries: [], message: { role: 'assistant', stopReason: 'stop' }, toolResults: [], ...event },
+			ctx,
+		);
+	return { runtime, branch, ctx, pi, run };
+}
+
+it('commits the compaction as a boundary draft instead of aborting the loop', async () => {
+	const { branch, pi, run } = compactionSetup();
+	const result = await run({ toolResults: [{ role: 'toolResult', content: [] }] });
+
+	expect(result.entries).toHaveLength(1);
+	const draft = result.entries[0];
+	expect(draft.type).toBe('compaction');
+	// Snapped onto raw-4's chunk boundary: raw-5 and raw-6 stay verbatim.
+	expect(draft.firstKeptEntryId).toBe('raw-5');
+	expect(branch.map((entry: any) => entry.id)).toContain(draft.firstKeptEntryId);
+	expect(draft.summary).toContain('second');
+	// The loop decides on its own whether another turn follows: a boundary draft must not force one.
+	expect(result.continue).toBeUndefined();
+	// The old workaround injected a hidden user-role resume message; the boundary makes it obsolete.
+	expect(pi.sendMessage).not.toHaveBeenCalled();
 });
-it('a cancelled compaction resumes a mid-run turn instead of orphaning it',()=>{
- const runtime=new Runtime();runtime.enabled=true;
- let handler:any, callbacks:any;
- const sendMessage=vi.fn();
- registerCompactionTrigger({on:(_n:any,h:any)=>handler=h,sendMessage} as any,runtime);
- handler({message:{stopReason:'toolUse'}},{hasUI:false,getContextUsage:()=>({tokens:999999}),compact:(c:any)=>callbacks=c});
- callbacks.onError({message:'Compaction cancelled'});
- expect(sendMessage).toHaveBeenCalledTimes(1);
- expect(sendMessage.mock.calls[0][0].customType).toBe('om.resume');
- expect(sendMessage.mock.calls[0][1]).toEqual({triggerTurn:true});
- expect(runtime.compactInFlight).toBe(false);
+
+it('compacts a terminal turn too, without restarting it', async () => {
+	const { run } = compactionSetup();
+	const result = await run({ toolResults: [], message: { role: 'assistant', stopReason: 'stop' } });
+	expect(result.entries).toHaveLength(1);
+	expect(result.continue).toBeUndefined();
 });
-it('a cancelled compaction on a terminal turn stays stopped, and a failure never resumes',()=>{
- const runtime=new Runtime();runtime.enabled=true;
- let handler:any, callbacks:any;
- const sendMessage=vi.fn();
- registerCompactionTrigger({on:(_n:any,h:any)=>handler=h,sendMessage} as any,runtime);
- // Terminal turn: no pending tool work → compaction must not restart the run.
- handler({message:{stopReason:'stop'},toolResults:[]},{hasUI:false,getContextUsage:()=>({tokens:999999}),compact:(c:any)=>callbacks=c});
- callbacks.onError({message:'Compaction cancelled'});
- expect(sendMessage).not.toHaveBeenCalled();
- // Mid-run turn, but the compaction failed for another reason: the error is reported, not papered over.
- handler({message:{stopReason:'toolUse'}},{hasUI:false,getContextUsage:()=>({tokens:999999}),compact:(c:any)=>callbacks=c});
- callbacks.onError({message:'Summarization failed: boom'});
- expect(sendMessage).not.toHaveBeenCalled();
+
+it('refuses without a committed observation boundary, leaving the run untouched', async () => {
+	const { ctx, pi, run } = compactionSetup({ observed: false });
+	expect(await run()).toBeUndefined();
+	expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining('no confirmed observer boundary'), 'warning');
+	expect(pi.sendMessage).not.toHaveBeenCalled();
+});
+
+it('never compacts an errored or aborted turn, nor between retry attempts', async () => {
+	const { run } = compactionSetup();
+	expect(await run({ outcome: 'aborted' })).toBeUndefined();
+	expect(await run({ outcome: 'error' })).toBeUndefined();
+	expect(
+		await run({ message: { role: 'assistant', stopReason: 'error', errorMessage: 'rate limit exceeded (429)' } }),
+	).toBeUndefined();
+});
+
+it('stays quiet below the threshold', async () => {
+	const { ctx, run } = compactionSetup();
+	ctx.getContextUsage = () => ({ tokens: 1_000 });
+	expect(await run()).toBeUndefined();
+});
+
+it('skips the observer wait only when no in-flight observer can enter the block', async () => {
+	// Tail-region observer + stable snap ⇒ the block cannot change ⇒ no wait.
+	const tailObserver = compactionSetup();
+	tailObserver.runtime.observersInFlight.set('run-1', { controller: new AbortController(), coversUpToId: 'raw-6' });
+	expect((await tailObserver.run()).entries).toHaveLength(1);
+	expect(tailObserver.runtime.lastCompactionObserverWait).toBe('skipped');
+
+	// An observer covering a pre-cutoff chunk can still enter the block ⇒ wait for it.
+	const preCutoffObserver = compactionSetup();
+	preCutoffObserver.runtime.observersInFlight.set('run-2', { controller: new AbortController(), coversUpToId: 'raw-2' });
+	expect((await preCutoffObserver.run()).entries).toHaveLength(1);
+	expect(preCutoffObserver.runtime.lastCompactionObserverWait).toBe('waited');
+});
+
+it('drops the draft when the session changed while waiting on observers', async () => {
+	const { runtime, run } = compactionSetup();
+	runtime.observersInFlight.set('run-1', { controller: new AbortController(), coversUpToId: 'raw-2' });
+	let release!: () => void;
+	runtime.trackObserverTask(new Promise<void>((resolve) => { release = resolve; }));
+	const pending = run();
+	// om switched off / session replaced mid-wait: the draft belongs to a session that is gone.
+	runtime.abortAllWorkers();
+	release();
+	expect(await pending).toBeUndefined();
 });

@@ -227,13 +227,107 @@ export function canSkipObserverWait(
 	return true;
 }
 
+/** What a compaction would do, decided before either caller commits anything. */
+export type CompactionPlan =
+	| { status: "compact"; kind: Exclude<CutoffKind, "none">; firstKeptEntryId: string; summary: string; details: unknown }
+	| { status: "refuse"; reason: CancelReason | "aborted" };
+
+/** The context surface a plan needs, so both entry points can share `planCompaction`. */
+export type PlanContext = {
+	hasUI?: boolean;
+	ui?: { notify?: (message: string, level?: any) => void };
+	sessionManager?: { getBranch?: () => Entry[] };
+	/** This compaction's abort signal: the hook takes `event.signal`, the boundary `ctx.signal`. */
+	signal?: AbortSignal;
+};
+
+export type PlanOptions = {
+	/**
+	 * pi's proposed kept tail (`session_before_compact` only). A `turn_end` boundary has no such
+	 * proposal: it either finds a real observation cutoff or refuses. A refusal never reads it.
+	 */
+	proposedFirstKeptId?: string;
+	tailTokens: number;
+	maxTailTokens: number;
+};
+
+/**
+ * Decide and render one compaction. One implementation, two callers:
+ *  - `session_before_compact` — pi's own paths: `/compact`, pi's between-turn threshold, and
+ *    overflow recovery. The hook turns the plan into its `{ compaction }` decision.
+ *  - the `turn_end` boundary — om's own `compactAtContextTokens`, committed as a boundary draft
+ *    entry. Committing there never aborts the agent loop, so a refusal just means "not this
+ *    turn" and the run continues (or stops) on its own.
+ *
+ * The R5 observer wait lives here so both callers share it (design R5): a boundary snap whose
+ * tail is already at target and that no in-flight observer can enter the rendered block skips
+ * the wait; every other case waits, then re-reads the branch so just-committed observations are
+ * folded into the block.
+ */
+export async function planCompaction(
+	runtime: Runtime,
+	ctx: PlanContext,
+	branch: Entry[],
+	options: PlanOptions,
+): Promise<CompactionPlan> {
+	const { tailTokens, maxTailTokens } = options;
+	const notify = (message: string, level: string) => {
+		if (ctx.hasUI) ctx.ui?.notify?.(message, level);
+	};
+	// Placeholder only: the snap returns it with `kind: "none"`, which refuses below.
+	const proposed = options.proposedFirstKeptId ?? branch.at(-1)?.id ?? "";
+
+	let settled = branch;
+	let snap = snapCutoff(settled, proposed, tailTokens, maxTailTokens);
+
+	const skip =
+		snap.kind === "boundary" &&
+		canSkipObserverWait(settled, snap.firstKeptId, snap.tail, tailTokens, runtime.observersInFlight.values());
+	runtime.lastCompactionObserverWait = skip ? "skipped" : "waited";
+	if (!skip) {
+		if (ctx.hasUI && runtime.observersInFlight.size > 0)
+			notify("om: waiting for in-flight observers before folding…", "info");
+		await runtime.whenObserversIdle();
+		settled = (ctx.sessionManager?.getBranch?.() as Entry[] | undefined) ?? settled;
+		snap = snapCutoff(settled, proposed, tailTokens, maxTailTokens);
+	}
+
+	if (ctx.signal?.aborted) return { status: "refuse", reason: "aborted" };
+	const decision = decideCompaction(snap, observerStalled(runtime, runtime.config.maxWorkerAttempts));
+	if (decision.action === "cancel") {
+		notify(CANCEL_NOTICES[decision.reason], "warning");
+		return { status: "refuse", reason: decision.reason };
+	}
+	// `decideCompaction` only lets boundary/forward snaps through; narrow for the plan's type.
+	if (snap.kind === "none") return { status: "refuse", reason: snap.reason ?? "no-observation-boundary" };
+	if (snap.kind === "forward")
+		notify(
+			`om: observer is behind — cutting ahead of it so the verbatim tail stays near ${Math.round(tailTokens / 1000)}k tokens`,
+			"info",
+		);
+
+	// Phase B: render the long-term tier live from disk, regenerated each compaction (throwaway
+	// projections — cannot decay). The journey is the running descriptive history the consolidator
+	// maintains; the map is the topic-file index.
+	const projection = buildCompactionProjection(settled, snap.firstKeptId);
+	const journey = readJourney(runtime.memoryRoot);
+	const map = renderMemoryMap(listTopics(runtime.memoryRoot));
+
+	return {
+		status: "compact",
+		kind: snap.kind,
+		firstKeptEntryId: snap.firstKeptId,
+		summary: renderSummary(journey, map, projection.observations),
+		details: projection.details,
+	};
+}
+
 export function registerCompactionHook(pi: ExtensionAPI, runtime: Runtime): void {
 	pi.on("session_before_compact", async (event: any, ctx: any) => {
 		if (!runtime.enabled || runtime.config.passive) return undefined;
 
-		const hasUI = ctx.hasUI;
 		if (runtime.compactHookInFlight) {
-			if (hasUI) ctx.ui.notify("om: another compaction is already in progress; cancelling duplicate", "warning");
+			if (ctx.hasUI) ctx.ui.notify("om: another compaction is already in progress; cancelling duplicate", "warning");
 			return { cancel: true };
 		}
 
@@ -241,61 +335,32 @@ export function registerCompactionHook(pi: ExtensionAPI, runtime: Runtime): void
 		runtime.compactHookInFlight = true;
 		try {
 			runtime.ensureConfig(ctx.cwd);
-			const tailTokens = runtime.config.tailTokens;
-			const maxTailTokens = runtime.config.maxTailTokens;
-			const { firstKeptEntryId, tokensBefore } = event.preparation;
+			// pi's `event.branchEntries` is stale after any observer wait, so the plan re-reads the
+			// branch itself; this read is only the starting point (and the fallback).
+			const branch = (ctx.sessionManager?.getBranch?.() as Entry[] | undefined) ?? (event.branchEntries as Entry[]);
+			const plan = await planCompaction(
+				runtime,
+				{
+					hasUI: ctx.hasUI,
+					ui: ctx.ui,
+					sessionManager: ctx.sessionManager,
+					signal: event.signal ?? ctx.signal,
+				},
+				branch,
+				{
+					proposedFirstKeptId: event.preparation.firstKeptEntryId,
+					tailTokens: runtime.config.tailTokens,
+					maxTailTokens: runtime.config.maxTailTokens,
+				},
+			);
 
-			// Compute the snap from the CURRENT (pre-wait) branch. The snap only reads committed
-			// chunk boundaries (fixed at hook entry), so this is safe to do before any wait and lets
-			// us decide whether the wait is needed at all.
-			let branch = (ctx.sessionManager?.getBranch?.() as Entry[] | undefined) ?? (event.branchEntries as Entry[]);
-			let snap = snapCutoff(branch, firstKeptEntryId, tailTokens, maxTailTokens);
-
-			// R5 fast path: skip the wait when no in-flight observer can affect this compaction
-			// (its chunk lands in the verbatim tail and the snap is stable). Otherwise wait for
-			// observers to settle, then re-read the branch and recompute the snap so just-committed
-			// `om.observations.recorded` entries are folded (pi's `event.branchEntries` is stale).
-			// Only a boundary snap is provably stable under skipped observers; a forward cut should
-			// wait, because a just-committed boundary can replace it with a fully observed cutoff.
-			const skip =
-				snap.kind === "boundary" &&
-				canSkipObserverWait(branch, snap.firstKeptId, snap.tail, tailTokens, runtime.observersInFlight.values());
-			runtime.lastCompactionObserverWait = skip ? "skipped" : "waited";
-			if (!skip) {
-				if (hasUI && runtime.observersInFlight.size > 0)
-					ctx.ui.notify("om: waiting for in-flight observers before folding…", "info");
-				await runtime.whenObserversIdle();
-				branch = (ctx.sessionManager?.getBranch?.() as Entry[] | undefined) ?? (event.branchEntries as Entry[]);
-				snap = snapCutoff(branch, firstKeptEntryId, tailTokens, maxTailTokens);
-			}
-
-			if (!runtime.isCurrent(generation) || event.signal?.aborted) return { cancel: true };
-			const decision = decideCompaction(snap, observerStalled(runtime, runtime.config.maxWorkerAttempts));
-			if (decision.action === "cancel") {
-				if (hasUI) ctx.ui.notify(CANCEL_NOTICES[decision.reason], "warning");
-				return { cancel: true };
-			}
-			if (snap.kind === "forward" && hasUI) {
-				ctx.ui.notify(
-					`om: observer is behind — cutting ahead of it so the verbatim tail stays near ${Math.round(tailTokens / 1000)}k tokens`,
-					"info",
-				);
-			}
-			const snapped = snap.firstKeptId;
-			const projection = buildCompactionProjection(branch, snapped);
-			// Phase B: render the long-term tier live from disk, regenerated each compaction
-			// (throwaway projections — cannot decay). The journey is the running descriptive history
-			// the consolidator maintains; the map is the topic-file index.
-			const journey = readJourney(runtime.memoryRoot);
-			const map = renderMemoryMap(listTopics(runtime.memoryRoot));
-			const summary = renderSummary(journey, map, projection.observations);
-
+			if (!runtime.isCurrent(generation) || plan.status === "refuse") return { cancel: true };
 			return {
 				compaction: {
-					summary,
-					firstKeptEntryId: snapped,
-					tokensBefore,
-					details: projection.details,
+					summary: plan.summary,
+					firstKeptEntryId: plan.firstKeptEntryId,
+					tokensBefore: event.preparation.tokensBefore,
+					details: plan.details,
 				},
 			};
 		} finally {
