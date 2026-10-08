@@ -14,20 +14,32 @@ pi install git:git@github.com:michielpapenhove/pi-observational-memory.git
 
 In Pi, run `/reload`, then `/om on` in a new session. Remove or disable any other installation of observational-memory first so the extension loads only once. See [Adoption](#adoption) when switching from upstream.
 
-Worker models use the `observational-memory` namespace in `~/.pi/agent/settings.json`. For example, merge this section into your settings to use DeepSeek:
+Worker models use the `observational-memory` namespace in `~/.pi/agent/settings.json`. First run `pi --list-models deepseek` to check the model IDs on your installation. The example uses Michiel's `deepseek-flash` alias; if it is not listed, replace it with an available model ID. Merge this section into your settings; do not overwrite the rest of the file:
 
 ```json
 {
   "observational-memory": {
     "models": {
-      "observer": { "provider": "deepseek", "id": "deepseek-v4-flash", "thinking": "high" },
-      "consolidator": { "provider": "deepseek", "id": "deepseek-v4-flash", "thinking": "high" }
+      "observer": { "provider": "deepseek", "id": "deepseek-flash", "thinking": "high" },
+      "consolidator": { "provider": "deepseek", "id": "deepseek-flash", "thinking": "high" }
     }
   }
 }
 ```
 
 Configure provider credentials locally in Pi; they are not part of this repository. Conversation chunks are sent to the configured worker providers, so choose providers permitted for your work data. Without overrides, the workers use the OpenRouter defaults listed below.
+
+### First-session checklist
+
+1. Use your own GitHub access and provider credentials. Do not copy another user's Pi settings, authentication files, sessions or `.memory/` tree. Observer/consolidator models are configured separately from the main chat model.
+2. Add `.memory/` to each project's `.gitignore`, or to your global Git ignore file, before enabling OM. It contains conversation-derived working memory and worker records, not source code.
+3. Start a fresh test session, run `/om on`, and use it for a normal task. OM defaults to **off per session**. Leave CLM or other context-rewriting extensions off during the test.
+4. Check `/om:status` for the memory path, worker errors, coverage and recorded worker costs. OM makes additional model calls; this cost readout does not include your main chat model and is not a spending limit. No worker activity in a short conversation is expected: the default observation chunk is 10,000 tokens.
+5. Run `/om off` to stop OM in that session. Existing memories are retained. Do not delete the memory tree of an existing OM session; see [Adoption](#adoption).
+
+Check your Pi version with `pi --version`. Development checks use the versions in `package-lock.json`; they do not certify every Pi version. Before relying on a new installation for a long session, verify worker activity and compaction in a test session. The default compaction threshold is 150,000 tokens; lower `compactAtContextTokens` with sufficient headroom if your main model has a smaller context window.
+
+### Updating
 
 To update later, stop OM and let workers exit, then run:
 
