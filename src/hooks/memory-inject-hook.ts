@@ -60,7 +60,7 @@ export function buildMemoryIntro(memoryRoot: string): string | undefined {
 		);
 	}
 	intro.push(
-		"Read the relevant topic file(s) and/or JOURNEY.md BEFORE re-deriving or re-explaining known context, and before asking Michiel for information that is already recorded.",
+		"Read the relevant topic file(s) and/or JOURNEY.md BEFORE re-deriving or re-explaining known context, and before asking the user for information that is already recorded.",
 	);
 	return intro.join("\n\n");
 }

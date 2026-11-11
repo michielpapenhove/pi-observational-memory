@@ -1,12 +1,39 @@
-# Observational memory: Michiel's fork
+# Observational memory for Pi (community fork)
 
-A Pi extension that compresses conversation chunks into observations, then promotes older observations into topic files. Based on [amosblomqvist/pi-observational-memory](https://github.com/amosblomqvist/pi-observational-memory), commit `78a1efc`.
+A Pi extension that compresses conversation chunks into observations, then promotes older observations into topic files, so a long session keeps a small readable memory tree instead of an ever-growing transcript.
 
-This fork prioritizes predictable source coverage and explicit completion. The upstream `PLAN.md` is historical design context, not the current contract.
+This repository is a **fork** of [amosblomqvist/pi-observational-memory](https://github.com/amosblomqvist/pi-observational-memory), based on commit `78a1efc`. The original work is Amos Blomqvist's — see [LICENSE](LICENSE); this fork keeps the structure and tightens a few edge cases, and makes no claim to authorship of the original. The upstream `PLAN.md` is historical design context, not the current contract.
+
+## Why you might want this
+
+Long sessions degrade: the context fills with raw transcript, compaction gets lossy, and the model starts re-asking things it already knew. Observational memory keeps a small persistent tree per project — `.memory/<session-id>/` with an index, a short journey and flat topic files — and reads from that instead of from a transcript that no longer fits.
+
+- It does **not** make your main model cheaper or smarter per turn; it keeps the working context small.
+- It costs **extra model calls**: one observer per ~10k-token chunk, plus a consolidator when the observation pool fills. Those workers are separate from your chat model and are not capped by this extension.
+- It is **not a lossless database**. Receipts prove bookkeeping and file bytes, not semantic completeness.
+- Skip it for short conversations: until the first chunk boundary passes, nothing happens at all.
+
+## What this fork changes
+
+Relative to upstream `78a1efc`:
+
+- Coverage hardening: only a normal worker ending with a valid run-bound receipt advances the ledger, and a failed chunk stays first in line.
+- Correctable schema rejections for both observer and consolidator confirmations, with separate correction budgets for confirmation edits and for exact-match file edits.
+- Compaction never snaps the cutoff at or behind an existing compaction entry, and a lagging observer no longer forces an unbounded verbatim tail.
+- Compaction runs are committed as a `turn_end` boundary draft.
+- Session-start memory intro (`before_agent_start`) so forks and never-compacted sessions can see their seeded memory map.
+- `max` is accepted as a worker thinking level.
+- Dev dependencies track the Pi version used for type checks.
 
 ## Install
 
-Requires a working Pi installation with `pi` on PATH, Git, Node.js/npm, and SSH access to this private GitHub repository:
+Requires a working Pi installation with `pi` on PATH, Git, and Node.js/npm. The extension ships as TypeScript and is loaded by Pi directly: there are no runtime npm dependencies and no build step.
+
+```bash
+pi install git:https://github.com/michielpapenhove/pi-observational-memory.git
+```
+
+If you have SSH credentials for GitHub, the SSH form works as well:
 
 ```bash
 pi install git:git@github.com:michielpapenhove/pi-observational-memory.git
@@ -14,7 +41,7 @@ pi install git:git@github.com:michielpapenhove/pi-observational-memory.git
 
 In Pi, run `/reload`, then `/om on` in a new session. Remove or disable any other installation of observational-memory first so the extension loads only once. See [Adoption](#adoption) when switching from upstream.
 
-Worker models use the `observational-memory` namespace in `~/.pi/agent/settings.json`. First run `pi --list-models deepseek` to check the model IDs on your installation. The example uses Michiel's `deepseek-flash` alias; if it is not listed, replace it with an available model ID. Merge this section into your settings; do not overwrite the rest of the file:
+Worker models use the `observational-memory` namespace in `~/.pi/agent/settings.json`. Run `pi --list-models` to see the model IDs available on your installation and use those. The example below uses a DeepSeek alias and is only an example — replace it with something you actually have. Merge this section into your settings; do not overwrite the rest of the file:
 
 ```json
 {
@@ -27,24 +54,24 @@ Worker models use the `observational-memory` namespace in `~/.pi/agent/settings.
 }
 ```
 
-Configure provider credentials locally in Pi; they are not part of this repository. Conversation chunks are sent to the configured worker providers, so choose providers permitted for your work data. Without overrides, the workers use the OpenRouter defaults listed below.
+Configure provider credentials locally in Pi; they are not part of this repository. Conversation chunks are sent to the configured worker providers, so choose providers permitted for your work data. Without overrides, the workers use the OpenRouter defaults listed below. `thinking` accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max` (`max` is a fork addition).
 
 ### First-session checklist
 
-1. Use your own GitHub access and provider credentials. Do not copy another user's Pi settings, authentication files, sessions or `.memory/` tree. Observer/consolidator models are configured separately from the main chat model.
+1. Use your own Pi installation and provider credentials. Do not copy another user's Pi settings, authentication files, sessions or `.memory/` tree. Observer/consolidator models are configured separately from the main chat model.
 2. Add `.memory/` to each project's `.gitignore`, or to your global Git ignore file, before enabling OM. It contains conversation-derived working memory and worker records, not source code.
 3. Start a fresh test session, run `/om on`, and use it for a normal task. OM defaults to **off per session**. Leave CLM or other context-rewriting extensions off during the test.
 4. Check `/om:status` for the memory path, worker errors, coverage and recorded worker costs. OM makes additional model calls; this cost readout does not include your main chat model and is not a spending limit. No worker activity in a short conversation is expected: the default observation chunk is 10,000 tokens.
 5. Run `/om off` to stop OM in that session. Existing memories are retained. Do not delete the memory tree of an existing OM session; see [Adoption](#adoption).
 
-Check your Pi version with `pi --version`. Development checks use the versions in `package-lock.json`; they do not certify every Pi version. Before relying on a new installation for a long session, verify worker activity and compaction in a test session. The default compaction threshold is 150,000 tokens; lower `compactAtContextTokens` with sufficient headroom if your main model has a smaller context window.
+Check your Pi version with `pi --version`. This fork is used daily on Pi 1.5.x; the type checks still track the versions in `package-lock.json` (0.87.0) and do not certify every intermediate Pi version. Before relying on a new installation for a long session, verify worker activity and compaction in a test session. The default compaction threshold is 150,000 tokens; lower `compactAtContextTokens` with sufficient headroom if your main model has a smaller context window.
 
 ### Updating
 
 To update later, stop OM and let workers exit, then run:
 
 ```bash
-pi update --extension git:git@github.com:michielpapenhove/pi-observational-memory.git
+pi update --extension git:https://github.com/michielpapenhove/pi-observational-memory.git
 ```
 
 Run `/reload` and `/om on` afterward. Updating this fork does not require discarding its existing sessions or memories.
@@ -91,6 +118,10 @@ Self-gating, no leakage: the per-session `/om` gate (`runtime.enabled`/`memoryRo
 - `/om:consolidate`: manual consolidation, bypassing threshold/backoff/attempt limit, but not an active run.
 
 The footer retains O/C/X gauges and cost. Running worker widgets show elapsed time, successful write/edit operations, last tool and age of that activity. Elapsed time is not proof of progress; “awaiting activity” can mean the model is thinking or waiting on its provider.
+
+## Compaction ownership
+
+OM compacts on its own threshold (`compactAtContextTokens`, default 150,000). If something else in your setup also nudges you to compact — a context-budget hint, a manual `compact_context`, a habit — pick one captain per session. With OM on, let OM decide the moment and ignore the other hints; with OM off, you are the captain. Two regulators fighting over one session produce exactly the context growth this extension exists to prevent.
 
 ## Failure and lifecycle rules
 
@@ -144,3 +175,7 @@ Tests use temporary directories, mocked model workers and real dummy Node proces
 Do not replace code underneath running workers. Stop OM in active sessions and let workers exit before installing/reloading the fork.
 
 When switching from upstream, start with **new Pi sessions and empty OM memory**. Old OM ledgers may contain invalid coverage and old topic trees can be duplicated; this fork does not repair or certify them. Existing ordinary Pi conversation logs need not be deleted. Removing old `.memory/` files while resuming an old OM-enabled session is unsafe: its ledger may already have dropped observations in favor of those files. No automatic migration or deletion is performed.
+
+## License and attribution
+
+MIT, see [LICENSE](LICENSE). The original work is © 2026 Amos Blomqvist ([amosblomqvist/pi-observational-memory](https://github.com/amosblomqvist/pi-observational-memory)); this fork keeps that notice and adds the changes listed at the top of this file. Bugs in the fork are the fork's problem, not upstream's.
